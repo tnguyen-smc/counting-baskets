@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>Lunch Tracker | St. Mary's</title>
+<title>Counting Loaves | St. Mary Catholic School</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Fira+Sans:ital,wght@0,300;0,400;0,500;0,600;0,700;1,400&display=swap" rel="stylesheet">
 <script src="https://cdn.tailwindcss.com"></script>
@@ -41,6 +41,8 @@
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
+<!-- SheetJS: reads/writes .xlsx and .csv for roster batch-upload and lunch-count export -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <style>
   * { font-family: 'Fira Sans', sans-serif; }
   body { background-color: #fdf8f2; }
@@ -57,7 +59,7 @@
 <div id="root"></div>
 
 <script type="text/babel" data-presets="react">
-const { useState, useEffect, useMemo } = React;
+const { useState, useEffect, useMemo, useRef } = React;
 
 /* ============================ FIREBASE CONFIGURATION ============================ */
 // TODO: replace with your Firebase project's web app config.
@@ -92,6 +94,12 @@ const firebaseConfig = {
   classroom rosters, student rosters, and term settings can only be changed by an
   authenticated admin. Consider tightening further (e.g. Firebase App Check, or
   requiring auth on log writes too) before using this in production.
+
+  NOTE ON CONCURRENCY: every daily log document is keyed deterministically as
+  "YYYY-MM-DD__classroomId" (see logId() below) and every read uses a live
+  onSnapshot listener, so two teachers (or a teacher and an admin) working at the
+  same time always see each other's updates immediately and never collide on a
+  document ID.
 */
 
 const FIREBASE_NOT_CONFIGURED = firebaseConfig.apiKey === 'YOUR_API_KEY';
@@ -106,6 +114,10 @@ if (!FIREBASE_NOT_CONFIGURED) {
 
 /* ============================ CONSTANTS ============================ */
 const AVATAR_COLORS = ['#3a5299','#5f78b2','#8fa2d0','#c98a3a','#3a9970','#993a5e','#8a3a99','#3a8f99'];
+const DAILY_PASSWORD = 'countingloaves';
+const DEVICE_AUTH_STORAGE_KEY = 'countingloaves_device_auth_date';
+const TERM_KEYS = ['Q1','Q2','Q3','Q4','S1','S2'];
+const TERM_LABELS = { Q1: 'Quarter 1', Q2: 'Quarter 2', Q3: 'Quarter 3', Q4: 'Quarter 4', S1: 'Semester 1', S2: 'Semester 2' };
 
 /* ============================ HELPERS ============================ */
 function pad2(n) { return n < 10 ? '0' + n : '' + n; }
@@ -130,7 +142,7 @@ function colorForName(name) {
   return AVATAR_COLORS[Math.abs(hash) % AVATAR_COLORS.length];
 }
 function uid(prefix) { return prefix + '_' + Math.random().toString(36).slice(2,9); }
-function classroomLabel(cls) { return cls ? (cls.grade + ' \u2014 ' + cls.teacher) : 'Unknown Classroom'; }
+function classroomLabel(cls) { return cls ? (cls.grade + ' — ' + cls.teacher) : 'Unknown Classroom'; }
 function logId(dateStr, classroomId) { return dateStr + '__' + classroomId; }
 function defaultEntry() { return { absent: false, meal: 'hot', milk: 'none' }; }
 function emptyEntries(roster) {
@@ -148,6 +160,18 @@ function tallyEntries(entries, roster) {
   });
   return { hot, sack, absent, white, choc, total: roster.length };
 }
+function entryChanged(preE, finalE) {
+  const a = preE || defaultEntry(), b = finalE || defaultEntry();
+  return a.absent !== b.absent || a.meal !== b.meal || a.milk !== b.milk;
+}
+function entryStatusLabel(e) {
+  if (e.absent) return 'Absent';
+  return e.meal === 'hot' ? 'Hot Lunch' : 'Sack Lunch';
+}
+function entryMilkLabel(e) {
+  if (e.absent) return '—';
+  return e.milk === 'none' ? 'No Milk' : (e.milk === 'white' ? 'White Milk' : 'Chocolate Milk');
+}
 function getWeekRange(dateStr) {
   const d = parseDateStr(dateStr);
   const day = d.getDay();
@@ -161,26 +185,31 @@ function getMonthRange(monthStr) {
   const y = parts[0], m = parts[1];
   return { start: new Date(y, m - 1, 1), end: new Date(y, m, 0) };
 }
-function getWeeksInMonth(monthStr) {
-  const range = getMonthRange(monthStr);
-  const weeks = [];
-  let cursor = new Date(range.start);
-  const day = cursor.getDay();
-  const diffToMonday = day === 0 ? -6 : 1 - day;
-  cursor = addDays(cursor, diffToMonday);
-  while (cursor <= range.end) {
-    const wkStart = new Date(cursor);
-    const wkEnd = addDays(cursor, 4);
-    weeks.push({ start: wkStart, end: wkEnd });
-    cursor = addDays(cursor, 7);
-  }
-  return weeks;
+function getTermRange(settings, key) {
+  const t = settings && settings.terms && settings.terms[key];
+  if (!t || !t.start) return null;
+  return { start: parseDateStr(t.start), end: t.end ? parseDateStr(t.end) : parseDateStr(todayStr()) };
 }
-function getRangeSince(startDateStr, endRefDateStr) {
-  if (!startDateStr) return null;
-  const start = parseDateStr(startDateStr);
-  const end = parseDateStr(endRefDateStr || todayStr());
-  return { start, end: end < start ? start : end };
+function getSchoolYearRange(settings) {
+  const terms = (settings && settings.terms) || {};
+  let minStart = null, maxEnd = null;
+  Object.keys(terms).forEach(k => {
+    const t = terms[k];
+    if (t && t.start) { const s = parseDateStr(t.start); if (!minStart || s < minStart) minStart = s; }
+    if (t && t.end) { const e = parseDateStr(t.end); if (!maxEnd || e > maxEnd) maxEnd = e; }
+  });
+  if (!minStart) return null;
+  return { start: minStart, end: maxEnd || parseDateStr(todayStr()) };
+}
+function getStartOfYearToNow(settings) {
+  const terms = (settings && settings.terms) || {};
+  let minStart = null;
+  Object.keys(terms).forEach(k => {
+    const t = terms[k];
+    if (t && t.start) { const s = parseDateStr(t.start); if (!minStart || s < minStart) minStart = s; }
+  });
+  if (!minStart) return null;
+  return { start: minStart, end: parseDateStr(todayStr()) };
 }
 
 /* ============================ FIRESTORE ACCESS ============================ */
@@ -199,11 +228,11 @@ function useCollection(name) {
 }
 
 function useSettingsDoc() {
-  const [settings, setSettings] = useState({ semesterStart: '', quarterStart: '' });
+  const [settings, setSettings] = useState({ terms: {} });
   const [loading, setLoading] = useState(true);
   useEffect(() => {
     const unsub = db.collection('settings').doc('config').onSnapshot(
-      doc => { setSettings(doc.exists ? doc.data() : { semesterStart: '', quarterStart: '' }); setLoading(false); },
+      doc => { setSettings(doc.exists ? { terms: {}, ...doc.data() } : { terms: {} }); setLoading(false); },
       err => { console.error('Firestore settings read error:', err); setLoading(false); }
     );
     return () => unsub();
@@ -235,8 +264,8 @@ async function saveStudent(s) {
 }
 async function deleteStudentDoc(id) { await db.collection('students').doc(id).delete(); }
 
-async function saveSettings(settings) {
-  await db.collection('settings').doc('config').set(settings, { merge: true });
+async function saveSettings(patch) {
+  await db.collection('settings').doc('config').set(patch, { merge: true });
 }
 
 // Logs are always written as a full document (rather than partial merges) since the
@@ -255,153 +284,10 @@ async function saveLogFull(dateStr, classroomId, obj) {
   await db.collection('logs').doc(id).set(payload);
 }
 
-/* ============================ EXPORT (GOOGLE SHEETS COMPATIBLE TSV) ============================ */
-function tsvEscape(v) { return String(v == null ? '' : v).replace(/\t/g, ' ').replace(/\r?\n/g, ' '); }
-function rowsToTSV(rows) { return rows.map(r => r.map(tsvEscape).join('\t')).join('\n'); }
-function downloadTSV(filename, rows) {
-  const tsv = rowsToTSV(rows);
-  const blob = new Blob([tsv], { type: 'text/tab-separated-values;charset=utf-8;' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = filename;
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  URL.revokeObjectURL(url);
-}
-
-function buildDailyExportRows(data, dateStr) {
-  const rows = [];
-  rows.push(['Daily Lunch Count Export']);
-  rows.push(['Date', formatDisplayDate(dateStr)]);
-  rows.push([]);
-  rows.push(['Summary: Pre-Count vs Final Count']);
-  rows.push(['Classroom', 'Grade', 'Teacher', 'Stage', 'Hot Lunch', 'Sack Lunch', 'Absent', 'White Milk', 'Chocolate Milk', 'Total Students']);
-
-  const grand = { pre: { hot: 0, sack: 0, absent: 0, white: 0, choc: 0 }, final: { hot: 0, sack: 0, absent: 0, white: 0, choc: 0 }, total: 0 };
-
-  data.classrooms.forEach(cls => {
-    const roster = data.students.filter(s => s.classroomId === cls.id);
-    const log = data.logsById[logId(dateStr, cls.id)];
-    const preT = tallyEntries(log && log.pre && log.pre.entries, roster);
-    const finalT = tallyEntries(log && log.final && log.final.entries, roster);
-    rows.push([classroomLabel(cls), cls.grade, cls.teacher, 'Pre-Count', preT.hot, preT.sack, preT.absent, preT.white, preT.choc, roster.length]);
-    rows.push([classroomLabel(cls), cls.grade, cls.teacher, 'Final Count', finalT.hot, finalT.sack, finalT.absent, finalT.white, finalT.choc, roster.length]);
-    grand.pre.hot += preT.hot; grand.pre.sack += preT.sack; grand.pre.absent += preT.absent; grand.pre.white += preT.white; grand.pre.choc += preT.choc;
-    grand.final.hot += finalT.hot; grand.final.sack += finalT.sack; grand.final.absent += finalT.absent; grand.final.white += finalT.white; grand.final.choc += finalT.choc;
-    grand.total += roster.length;
-  });
-
-  rows.push(['GRAND TOTAL', '', '', 'Pre-Count', grand.pre.hot, grand.pre.sack, grand.pre.absent, grand.pre.white, grand.pre.choc, grand.total]);
-  rows.push(['GRAND TOTAL', '', '', 'Final Count', grand.final.hot, grand.final.sack, grand.final.absent, grand.final.white, grand.final.choc, grand.total]);
-  rows.push([]);
-  rows.push(['Student-Level Final Count Detail']);
-  rows.push(['Classroom', 'Grade', 'Teacher', 'Student', 'Final Status', 'Milk']);
-
-  data.classrooms.forEach(cls => {
-    const roster = data.students.filter(s => s.classroomId === cls.id);
-    const log = data.logsById[logId(dateStr, cls.id)];
-    const entries = (log && log.final && log.final.entries) || {};
-    roster.forEach(s => {
-      const e = entries[s.id] || defaultEntry();
-      const status = e.absent ? 'Absent' : (e.meal === 'hot' ? 'Hot Lunch (Full Portion)' : 'Sack Lunch');
-      const milk = e.absent ? '\u2014' : (e.milk === 'none' ? 'No Milk' : (e.milk === 'white' ? 'White Milk' : 'Chocolate Milk'));
-      rows.push([classroomLabel(cls), cls.grade, cls.teacher, s.name, status, milk]);
-    });
-  });
-
-  return rows;
-}
-
-function buildWeeklyExportRows(data, dateStr) {
-  const wr = getWeekRange(dateStr);
-  const dayStrs = [0,1,2,3,4].map(i => toDateStr(addDays(wr.start, i)));
-
-  const rows = [];
-  rows.push(['Weekly Lunch Count Export']);
-  rows.push(['Week Of', formatShortDate(dayStrs[0]) + ' to ' + formatShortDate(dayStrs[4])]);
-  rows.push([]);
-  rows.push(['Classroom', 'Grade', 'Teacher', 'Student'].concat(dayStrs.map(formatShortDate)));
-
-  const totals = { hot: 0, sack: 0, absent: 0, white: 0, choc: 0 };
-
-  data.classrooms.forEach(cls => {
-    const roster = data.students.filter(s => s.classroomId === cls.id);
-    roster.forEach(s => {
-      const cells = [classroomLabel(cls), cls.grade, cls.teacher, s.name];
-      dayStrs.forEach(d => {
-        const log = data.logsById[logId(d, cls.id)];
-        if (!log || !log.final || !log.final.submitted) { cells.push('\u2014'); return; }
-        const e = log.final.entries[s.id] || defaultEntry();
-        if (e.absent) { cells.push('Absent'); totals.absent++; return; }
-        let cell = e.meal === 'hot' ? 'Hot' : 'Sack';
-        if (e.meal === 'hot') totals.hot++; else totals.sack++;
-        if (e.milk === 'white') { cell += ' / White Milk'; totals.white++; }
-        else if (e.milk === 'chocolate') { cell += ' / Choc. Milk'; totals.choc++; }
-        cells.push(cell);
-      });
-      rows.push(cells);
-    });
-  });
-
-  rows.push([]);
-  rows.push(['Weekly Summary Totals']);
-  rows.push(['Total Hot Lunches', totals.hot]);
-  rows.push(['Total Sack Lunches', totals.sack]);
-  rows.push(['Total White Milk', totals.white]);
-  rows.push(['Total Chocolate Milk', totals.choc]);
-  rows.push(['Total Absences', totals.absent]);
-  return rows;
-}
-
-function buildMonthlyExportRows(data, monthStr) {
-  const weeks = getWeeksInMonth(monthStr);
-  const monthLabel = getMonthRange(monthStr).start.toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
-
-  const rows = [];
-  rows.push(['Monthly Lunch Count Export']);
-  rows.push(['Month', monthLabel]);
-  rows.push([]);
-  rows.push(['Classroom', 'Grade', 'Teacher', 'Student'].concat(weeks.map((w, i) => 'Week ' + (i + 1) + ' (' + formatShortDate(toDateStr(w.start)) + '-' + formatShortDate(toDateStr(w.end)) + ')')));
-
-  const monthTotals = { hot: 0, sack: 0, absent: 0, white: 0, choc: 0 };
-
-  data.classrooms.forEach(cls => {
-    const roster = data.students.filter(s => s.classroomId === cls.id);
-    roster.forEach(s => {
-      const cells = [classroomLabel(cls), cls.grade, cls.teacher, s.name];
-      weeks.forEach(w => {
-        let hot = 0, sack = 0, absent = 0, white = 0, choc = 0;
-        for (let i = 0; i < 5; i++) {
-          const d = toDateStr(addDays(w.start, i));
-          const log = data.logsById[logId(d, cls.id)];
-          if (!log || !log.final || !log.final.submitted) continue;
-          const e = log.final.entries[s.id] || defaultEntry();
-          if (e.absent) { absent++; continue; }
-          if (e.meal === 'hot') hot++; else sack++;
-          if (e.milk === 'white') white++; else if (e.milk === 'chocolate') choc++;
-        }
-        cells.push(hot + ' Hot, ' + sack + ' Sack, ' + absent + ' Absent, ' + white + ' White Milk, ' + choc + ' Choc. Milk');
-        monthTotals.hot += hot; monthTotals.sack += sack; monthTotals.absent += absent; monthTotals.white += white; monthTotals.choc += choc;
-      });
-      rows.push(cells);
-    });
-  });
-
-  rows.push([]);
-  rows.push(['Monthly Summary Totals (All Weeks Aggregated)']);
-  rows.push(['Total Hot Lunches', monthTotals.hot]);
-  rows.push(['Total Sack Lunches', monthTotals.sack]);
-  rows.push(['Total White Milk', monthTotals.white]);
-  rows.push(['Total Chocolate Milk', monthTotals.choc]);
-  rows.push(['Total Absences', monthTotals.absent]);
-  return rows;
-}
-
+/* ============================ AGGREGATION (ANALYTICS + EXPORT) ============================ */
 function aggregateRange(data, startDate, endDate) {
   const result = {};
-  data.classrooms.forEach(c => { result[c.id] = { hot: 0, sack: 0, absent: 0, white: 0, choc: 0, daysLogged: 0, daysVerified: 0 }; });
+  data.classrooms.forEach(c => { result[c.id] = { hot: 0, sack: 0, absent: 0, white: 0, choc: 0 }; });
   data.logs.forEach(log => {
     const d = parseDateStr(log.date);
     if (d < startDate || d > endDate) return;
@@ -414,10 +300,86 @@ function aggregateRange(data, startDate, endDate) {
     result[log.classroomId].absent += t.absent;
     result[log.classroomId].white += t.white;
     result[log.classroomId].choc += t.choc;
-    result[log.classroomId].daysLogged++;
-    if (log.verified) result[log.classroomId].daysVerified++;
   });
   return result;
+}
+function aggregateRangeByStudent(data, startDate, endDate) {
+  const result = {};
+  data.students.forEach(s => { result[s.id] = { hot: 0, sack: 0, absent: 0, white: 0, choc: 0 }; });
+  data.logs.forEach(log => {
+    const d = parseDateStr(log.date);
+    if (d < startDate || d > endDate) return;
+    if (!log.final || !log.final.submitted) return;
+    const roster = data.students.filter(s => s.classroomId === log.classroomId);
+    roster.forEach(s => {
+      if (!result[s.id]) return;
+      const e = (log.final.entries && log.final.entries[s.id]) || defaultEntry();
+      if (e.absent) { result[s.id].absent++; return; }
+      if (e.meal === 'hot') result[s.id].hot++; else result[s.id].sack++;
+      if (e.milk === 'white') result[s.id].white++; else if (e.milk === 'chocolate') result[s.id].choc++;
+    });
+  });
+  return result;
+}
+
+/* ============================ EXPORT (EXCEL / CSV) ============================ */
+function csvEscape(v) {
+  const s = String(v == null ? '' : v);
+  if (/[",\n]/.test(s)) return '"' + s.replace(/"/g, '""') + '"';
+  return s;
+}
+function rowsToCSV(rows) { return rows.map(r => r.map(csvEscape).join(',')).join('\r\n'); }
+function downloadCSV(filename, rows) {
+  const csv = rowsToCSV(rows);
+  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+function downloadXLSX(filename, rows) {
+  const ws = XLSX.utils.aoa_to_sheet(rows);
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'Lunch Count Export');
+  XLSX.writeFile(wb, filename);
+}
+
+function buildRangeExportRows(data, startDate, endDate, rangeLabel) {
+  const rows = [];
+  rows.push(['Lunch Count Export']);
+  rows.push(['Range', rangeLabel]);
+  rows.push(['Generated', formatDisplayDate(todayStr())]);
+  rows.push([]);
+  rows.push(['Classroom Summary (Final Counts Only)']);
+  rows.push(['Classroom', 'Grade', 'Teacher', 'Hot Lunch', 'Sack Lunch', 'Absent', 'White Milk', 'Chocolate Milk', 'Total Students']);
+
+  const agg = aggregateRange(data, startDate, endDate);
+  const grand = { hot: 0, sack: 0, absent: 0, white: 0, choc: 0, total: 0 };
+
+  data.classrooms.forEach(cls => {
+    const roster = data.students.filter(s => s.classroomId === cls.id);
+    const v = agg[cls.id] || { hot: 0, sack: 0, absent: 0, white: 0, choc: 0 };
+    rows.push([classroomLabel(cls), cls.grade, cls.teacher, v.hot, v.sack, v.absent, v.white, v.choc, roster.length]);
+    grand.hot += v.hot; grand.sack += v.sack; grand.absent += v.absent; grand.white += v.white; grand.choc += v.choc;
+    grand.total += roster.length;
+  });
+  rows.push(['GRAND TOTAL', '', '', grand.hot, grand.sack, grand.absent, grand.white, grand.choc, grand.total]);
+
+  rows.push([]);
+  rows.push(['Student-Level Detail (Final Counts Only)']);
+  rows.push(['Classroom', 'Grade', 'Teacher', 'Student', 'Hot Lunch', 'Sack Lunch', 'Absent Days', 'White Milk', 'Chocolate Milk']);
+
+  const studentAgg = aggregateRangeByStudent(data, startDate, endDate);
+  data.classrooms.forEach(cls => {
+    const roster = data.students.filter(s => s.classroomId === cls.id);
+    roster.forEach(s => {
+      const v = studentAgg[s.id] || { hot: 0, sack: 0, absent: 0, white: 0, choc: 0 };
+      rows.push([classroomLabel(cls), cls.grade, cls.teacher, s.name, v.hot, v.sack, v.absent, v.white, v.choc]);
+    });
+  });
+
+  return rows;
 }
 
 /* ============================ SMALL UI PRIMITIVES ============================ */
@@ -454,20 +416,6 @@ function StatCard({ label, value }) {
   );
 }
 
-function BarRow({ label, value, max, color }) {
-  const pct = max > 0 ? Math.round((value / max) * 100) : 0;
-  return (
-    <div className="mb-3">
-      <div className="flex justify-between text-sm font-medium text-primary-700 mb-1">
-        <span>{label}</span><span className="font-bold">{value}</span>
-      </div>
-      <div className="w-full bg-primary-50 rounded-full h-3 overflow-hidden">
-        <div className="h-3 rounded-full transition-fast" style={{ width: pct + '%', backgroundColor: color }}></div>
-      </div>
-    </div>
-  );
-}
-
 function PrimaryButton({ children, onClick, className, disabled, type }) {
   return (
     <button
@@ -490,6 +438,74 @@ function GhostButton({ children, onClick, className, type }) {
     >
       {children}
     </button>
+  );
+}
+
+function SuccessModal({ title, message, onDone }) {
+  useEffect(() => {
+    const t = setTimeout(onDone, 2800);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line
+  }, []);
+  return (
+    <div className="fixed inset-0 bg-primary-900/50 flex items-center justify-center z-50 p-4">
+      <div className="bg-white rounded-2xl card-shadow-lg p-8 w-full max-w-sm text-center border-4 border-green-500">
+        <div className="w-16 h-16 rounded-full bg-green-100 text-green-600 flex items-center justify-center text-3xl mx-auto mb-4">✓</div>
+        <h2 className="text-xl font-bold text-green-700 mb-2">{title}</h2>
+        <p className="text-sm font-light text-primary-600 mb-6">{message}</p>
+        <button
+          onClick={onDone}
+          className="btn-touch w-full px-5 py-3 rounded-xl bg-green-600 text-white font-semibold text-base transition-fast hover:bg-green-700 active:scale-[0.98]"
+        >
+          Back to Home
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/* ============================ DAILY DEVICE PASSWORD GATE ============================ */
+function DailyPasswordGate({ children }) {
+  const [authed, setAuthed] = useState(() => {
+    try { return localStorage.getItem(DEVICE_AUTH_STORAGE_KEY) === todayStr(); } catch (e) { return false; }
+  });
+  const [pw, setPw] = useState('');
+  const [error, setError] = useState('');
+
+  function submit(e) {
+    e.preventDefault();
+    if (pw === DAILY_PASSWORD) {
+      try { localStorage.setItem(DEVICE_AUTH_STORAGE_KEY, todayStr()); } catch (e) {}
+      setAuthed(true);
+      setError('');
+    } else {
+      setError('Incorrect password. Please try again.');
+      setPw('');
+    }
+  }
+
+  if (authed) return children;
+
+  return (
+    <div className="fixed inset-0 bg-primary-900 flex items-center justify-center z-[100] p-4">
+      <div className="bg-white rounded-2xl card-shadow-lg p-8 w-full max-w-sm text-center">
+        <div className="text-4xl mb-3">🍞</div>
+        <h2 className="text-xl font-bold text-primary-900 mb-1">Counting Loaves</h2>
+        <p className="text-sm font-light text-primary-600 mb-6">Enter today's access password to continue. This is only needed once per device, per day.</p>
+        <form onSubmit={submit}>
+          <input
+            autoFocus
+            type="password"
+            value={pw}
+            onChange={e => { setPw(e.target.value); setError(''); }}
+            placeholder="Access password"
+            className="w-full border-2 border-primary-200 rounded-xl px-4 py-3 mb-3 text-center focus:outline-none focus:border-primary"
+          />
+          {error && <p className="text-sm text-rose-600 mb-3">{error}</p>}
+          <PrimaryButton type="submit" className="w-full">Unlock for Today</PrimaryButton>
+        </form>
+      </div>
+    </div>
   );
 }
 
@@ -538,7 +554,7 @@ function AdminLoginModal({ onClose, onSuccess }) {
           {error && <p className="text-sm text-rose-600 mb-2">{error}</p>}
           <div className="flex gap-2 mt-2">
             <GhostButton onClick={onClose} className="flex-1">Cancel</GhostButton>
-            <PrimaryButton type="submit" disabled={busy} className="flex-1">{busy ? 'Signing In\u2026' : 'Log In'}</PrimaryButton>
+            <PrimaryButton type="submit" disabled={busy} className="flex-1">{busy ? 'Signing In…' : 'Log In'}</PrimaryButton>
           </div>
         </form>
       </div>
@@ -547,19 +563,19 @@ function AdminLoginModal({ onClose, onSuccess }) {
 }
 
 /* ============================ NAV BAR ============================ */
-function NavBar({ role, onRequestRole, currentDate }) {
+function NavBar({ role, onRequestRole }) {
   return (
     <div className="bg-primary text-white sticky top-0 z-40 card-shadow">
       <div className="max-w-6xl mx-auto px-4 sm:px-6 py-4 flex items-center justify-between flex-wrap gap-3">
         <div className="flex items-center gap-3">
-          <img 
-            src="logo-school.png" 
-            alt="St. Mary Catholic School Logo" 
-            className="h-10 w-auto" 
+          <img
+            src="logo-school.png"
+            alt="St. Mary Catholic School Logo"
+            className="h-10 w-auto"
           />
           <div>
-            <h1 className="text-2xl font-bold leading-tight">St. Mary Catholic School Lunch Tracker</h1>
-            <p className="text-xs font-light text-primary-100 italic">{formatDisplayDate(currentDate)}</p>
+            <h1 className="text-lg sm:text-xl font-bold leading-tight tracking-wide">St. Mary Catholic School</h1>
+            <p className="text-xs sm:text-sm font-light text-primary-100">Counting Loaves · Lunch Counter App</p>
           </div>
         </div>
         <div className="flex bg-primary-700 rounded-xl p-1 gap-1">
@@ -597,7 +613,7 @@ function TeacherOverview({ data, onOpenClassroom }) {
   return (
     <div className="max-w-6xl mx-auto px-4 sm:px-6 py-8">
       <div className="mb-6">
-        <h2 className="text-2xl font-bold text-primary-900">Today's Classrooms</h2>
+        <h2 className="text-2xl font-bold text-primary-900">Today is {formatDisplayDate(today)}</h2>
         <p className="text-primary-600 font-light">Select a classroom to take the morning pre-count or lunchtime final count.</p>
       </div>
       <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-5">
@@ -650,7 +666,7 @@ function StudentEntryCard({ student, entry, onChange, disabled }) {
         onClick={() => set({ absent: !e.absent })}
         className={"absolute top-3 right-3 text-xs font-bold px-2.5 py-1.5 rounded-full transition-fast " + (e.absent ? 'bg-rose-600 text-white' : 'bg-rose-50 text-rose-600 hover:bg-rose-100')}
       >
-        {e.absent ? 'Absent' : 'Mark Absent'}
+        {e.absent ? 'Undo Absent' : 'Mark Absent'}
       </button>
 
       <div className={"flex items-center gap-3 pr-24 " + (e.absent ? 'opacity-60' : '')}>
@@ -697,6 +713,119 @@ function StudentEntryCard({ student, entry, onChange, disabled }) {
   );
 }
 
+/* ============================ TEACHER: 3-COLUMN REVIEW SCREEN ============================ */
+function ReviewStatusControl({ entry, onChange }) {
+  const options = [['hot','Hot Lunch'], ['sack','Sack Lunch'], ['absent','Absent']];
+  const current = entry.absent ? 'absent' : entry.meal;
+  return (
+    <select
+      value={current}
+      onChange={e => {
+        const v = e.target.value;
+        if (v === 'absent') onChange({ ...entry, absent: true });
+        else onChange({ ...entry, absent: false, meal: v });
+      }}
+      className="text-xs font-semibold border-2 border-primary-200 rounded-lg px-2 py-1 bg-white"
+    >
+      {options.map(([val,label]) => <option key={val} value={val}>{label}</option>)}
+    </select>
+  );
+}
+
+function ReviewStudentCard({ student, entry, onChange }) {
+  return (
+    <div className="bg-white rounded-xl card-shadow border border-primary-100 p-3 flex items-center gap-3">
+      <Avatar name={student.name} size={36} />
+      <div className="flex-1 min-w-0">
+        <p className="font-medium text-primary-900 truncate text-sm">{student.name}</p>
+        {!entry.absent && (
+          <div className="flex gap-1 mt-1">
+            {[['none','None'],['white','White'],['chocolate','Choc.']].map(([val,label]) => (
+              <button
+                key={val}
+                type="button"
+                onClick={() => onChange({ ...entry, milk: val })}
+                className={"px-2 py-0.5 rounded-full text-[11px] font-semibold border transition-fast " + (entry.milk === val ? 'bg-primary text-white border-primary' : 'bg-white text-primary-600 border-primary-200 hover:bg-primary-50')}
+              >{label}</button>
+            ))}
+          </div>
+        )}
+      </div>
+      <ReviewStatusControl entry={entry} onChange={onChange} />
+    </div>
+  );
+}
+
+function ReviewScreen({ stage, cls, roster, entries, onChangeEntry, onEdit, onSubmit }) {
+  const totals = tallyEntries(entries, roster);
+  const hotStudents = [], sackStudents = [], absentStudents = [];
+  roster.forEach(s => {
+    const e = entries[s.id] || defaultEntry();
+    if (e.absent) absentStudents.push(s);
+    else if (e.meal === 'hot') hotStudents.push(s);
+    else sackStudents.push(s);
+  });
+
+  const title = stage === 'pre' ? 'Review Morning Pre-Count' : 'Review Lunch Time Count';
+  const submitLabel = stage === 'pre' ? 'Submit Pre Count' : 'Submit Final Count';
+
+  const columns = [
+    { key: 'hot', label: 'Hot Lunch', students: hotStudents, color: 'border-green-300 bg-green-50' },
+    { key: 'sack', label: 'Sack Lunch', students: sackStudents, color: 'border-amber-300 bg-amber-50' },
+    { key: 'absent', label: 'Absent', students: absentStudents, color: 'border-gray-300 bg-gray-50' }
+  ];
+
+  return (
+    <div>
+      <button onClick={onEdit} className="text-primary font-semibold text-sm mb-4 hover:underline">&larr; Edit / Go Back</button>
+      <h2 className="text-2xl font-bold text-primary-900 mb-1">{title}</h2>
+      <p className="text-primary-600 font-light mb-6">{cls.grade} &middot; {cls.teacher} &middot; {formatDisplayDate(todayStr())}</p>
+
+      <div className="grid grid-cols-2 sm:grid-cols-5 gap-3 mb-6">
+        <StatCard label="Hot Lunch" value={totals.hot} />
+        <StatCard label="Sack Lunch" value={totals.sack} />
+        <StatCard label="Absent" value={totals.absent} />
+        <StatCard label="White Milk" value={totals.white} />
+        <StatCard label="Choc. Milk" value={totals.choc} />
+      </div>
+
+      <div className="grid md:grid-cols-3 gap-4 mb-6">
+        {columns.map(col => (
+          <div key={col.key} className={"rounded-2xl border-2 p-3 " + col.color}>
+            <div className="flex justify-between items-center mb-3 px-1">
+              <h3 className="font-bold text-primary-900 text-sm uppercase tracking-wide">{col.label}</h3>
+              <span className="text-sm font-bold text-primary-900 bg-white rounded-full px-2.5 py-0.5 border border-primary-100">{col.students.length}</span>
+            </div>
+            <div className="flex flex-col gap-2 min-h-[60px]">
+              {col.students.length === 0 && <p className="text-xs font-light text-primary-400 text-center py-4">No students</p>}
+              {col.students.map(s => (
+                <ReviewStudentCard
+                  key={s.id}
+                  student={s}
+                  entry={entries[s.id] || defaultEntry()}
+                  onChange={(entry) => onChangeEntry(s.id, entry)}
+                />
+              ))}
+            </div>
+          </div>
+        ))}
+      </div>
+
+      <div className="sticky bottom-0 bg-secondary/95 backdrop-blur pt-4 pb-2 border-t border-primary-100">
+        <div className="flex justify-between items-center flex-wrap gap-3">
+          <p className="text-sm text-primary-600 font-light">
+            Hot {totals.hot} &middot; Sack {totals.sack} &middot; Absent {totals.absent} &middot; White Milk {totals.white} &middot; Choc. Milk {totals.choc}
+          </p>
+          <div className="flex gap-3">
+            <GhostButton onClick={onEdit}>Edit / Go Back</GhostButton>
+            <PrimaryButton onClick={onSubmit}>{submitLabel}</PrimaryButton>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 /* ============================ TEACHER: CLASSROOM WORKSPACE ============================ */
 function ClassroomWorkspace({ data, classroomId, onBack }) {
   const cls = data.classrooms.find(c => c.id === classroomId);
@@ -707,6 +836,7 @@ function ClassroomWorkspace({ data, classroomId, onBack }) {
 
   const [stage, setStage] = useState('pre');
   const [reviewing, setReviewing] = useState(false);
+  const [successInfo, setSuccessInfo] = useState(null);
 
   useEffect(() => {
     if (!todayLog) {
@@ -750,12 +880,19 @@ function ClassroomWorkspace({ data, classroomId, onBack }) {
   async function submitPre() {
     const base = todayLog || { final: { entries: emptyEntries(roster), submitted: false, submittedAt: null }, verified: false, verifiedAt: null };
     await saveLogFull(today, classroomId, { ...base, pre: { entries: preEntries, submitted: true, submittedAt: new Date().toISOString() } });
+    setSuccessInfo({ stage: 'pre' });
   }
 
   async function submitFinal() {
     const base = todayLog || { pre: { entries: emptyEntries(roster), submitted: false, submittedAt: null }, verified: false, verifiedAt: null };
     await saveLogFull(today, classroomId, { ...base, final: { entries: finalEntries, submitted: true, submittedAt: new Date().toISOString() } });
+    setSuccessInfo({ stage: 'final' });
+  }
+
+  function handleDone() {
+    setSuccessInfo(null);
     setReviewing(false);
+    onBack();
   }
 
   const activeEntries = stage === 'pre' ? preEntries : finalEntries;
@@ -783,31 +920,39 @@ function ClassroomWorkspace({ data, classroomId, onBack }) {
           <p className="text-primary-600 font-light">No students assigned to this classroom yet. Ask your admin to add students under Admin View &rarr; Students.</p>
         </div>
       ) : reviewing ? (
-        <FinalReview
+        <ReviewScreen
+          stage={stage}
           cls={cls}
           roster={roster}
-          entries={finalEntries}
-          preTotals={tallyEntries(preEntries, roster)}
+          entries={activeEntries}
+          onChangeEntry={(studentId, entry) => updateEntry(stage, studentId, entry)}
           onEdit={() => setReviewing(false)}
-          onSubmit={submitFinal}
+          onSubmit={stage === 'pre' ? submitPre : submitFinal}
         />
       ) : (
         <React.Fragment>
-          <div className="flex gap-2 mb-6">
+          <div className="flex gap-2 mb-6 flex-wrap">
             <button
               onClick={() => setStage('pre')}
               className={"btn-touch px-5 py-2.5 rounded-xl font-semibold text-sm transition-fast border-2 " + (stage === 'pre' ? 'bg-primary text-white border-primary' : 'bg-white text-primary-700 border-primary-200 hover:bg-primary-50')}
             >
-              Morning Pre-Count {preSubmitted ? '\u2713' : ''}
+              Morning Pre-Count {preSubmitted ? '✓' : ''}
             </button>
             <button
-              onClick={() => setStage('final')}
-              className={"btn-touch px-5 py-2.5 rounded-xl font-semibold text-sm transition-fast border-2 " + (stage === 'final' ? 'bg-primary text-white border-primary' : 'bg-white text-primary-700 border-primary-200 hover:bg-primary-50')}
+              onClick={() => { if (preSubmitted) setStage('final'); }}
+              disabled={!preSubmitted}
+              title={!preSubmitted ? "Submit the Morning Pre-Count first" : ''}
+              className={"btn-touch px-5 py-2.5 rounded-xl font-semibold text-sm transition-fast border-2 disabled:opacity-40 disabled:cursor-not-allowed " + (stage === 'final' ? 'bg-primary text-white border-primary' : 'bg-white text-primary-700 border-primary-200 hover:bg-primary-50')}
             >
-              Lunchtime Final Count {finalSubmitted ? '\u2713' : ''}
+              Lunchtime Final Count {finalSubmitted ? '✓' : ''}{!preSubmitted ? ' 🔒' : ''}
             </button>
           </div>
 
+          {!preSubmitted && stage === 'pre' && (
+            <div className="mb-6 bg-primary-50 border border-primary-200 text-primary-700 rounded-xl p-4 text-sm font-medium">
+              Complete and submit the Morning Pre-Count before the Lunchtime Final Count unlocks.
+            </div>
+          )}
           {stage === 'pre' && preSubmitted && !verified && (
             <div className="mb-6 bg-amber-50 border border-amber-300 text-amber-800 rounded-xl p-4 text-sm font-medium">
               The pre-count was already submitted for today. You can still make corrections and re-submit.
@@ -843,69 +988,22 @@ function ClassroomWorkspace({ data, classroomId, onBack }) {
               </p>
               <div className="flex gap-3">
                 <GhostButton onClick={onBack}>Cancel</GhostButton>
-                {stage === 'pre' ? (
-                  <PrimaryButton disabled={verified} onClick={submitPre}>Submit Pre-Count</PrimaryButton>
-                ) : (
-                  <PrimaryButton disabled={verified} onClick={() => setReviewing(true)}>Review Final Count &rarr;</PrimaryButton>
-                )}
+                <PrimaryButton disabled={verified} onClick={() => setReviewing(true)}>
+                  {stage === 'pre' ? 'Review Morning Count' : 'Review Lunch Time Count'} &rarr;
+                </PrimaryButton>
               </div>
             </div>
           </div>
         </React.Fragment>
       )}
-    </div>
-  );
-}
 
-/* ============================ TEACHER: FINAL COUNT REVIEW ============================ */
-function FinalReview({ cls, roster, entries, preTotals, onEdit, onSubmit }) {
-  const totals = tallyEntries(entries, roster);
-
-  return (
-    <div>
-      <button onClick={onEdit} className="text-primary font-semibold text-sm mb-4 hover:underline">&larr; Edit / Go Back</button>
-      <h2 className="text-2xl font-bold text-primary-900 mb-1">Review Final Count</h2>
-      <p className="text-primary-600 font-light mb-6">{cls.grade} &middot; {cls.teacher} &middot; {formatDisplayDate(todayStr())}</p>
-
-      <div className="grid grid-cols-2 sm:grid-cols-5 gap-3 mb-3">
-        <StatCard label="Hot Lunch" value={totals.hot} />
-        <StatCard label="Sack Lunch" value={totals.sack} />
-        <StatCard label="Absent" value={totals.absent} />
-        <StatCard label="White Milk" value={totals.white} />
-        <StatCard label="Choc. Milk" value={totals.choc} />
-      </div>
-      <p className="text-xs font-light italic text-primary-500 mb-6">
-        Pre-count comparison: Hot {preTotals.hot} &middot; Sack {preTotals.sack} &middot; Absent {preTotals.absent}
-      </p>
-
-      <div className="bg-white rounded-2xl card-shadow border border-primary-100 divide-y divide-primary-50 mb-8 overflow-hidden">
-        {roster.map(s => {
-          const e = entries[s.id] || defaultEntry();
-          return (
-            <div key={s.id} className="flex items-center gap-3 p-4">
-              <Avatar name={s.name} size={40} />
-              <p className="font-medium text-primary-900 flex-1 truncate">{s.name}</p>
-              {e.absent ? (
-                <span className="text-xs font-semibold px-2 py-1 rounded-full bg-gray-200 text-gray-700">Absent</span>
-              ) : (
-                <React.Fragment>
-                  <span className={"text-xs font-semibold px-2 py-1 rounded-full " + (e.meal === 'hot' ? 'bg-green-100 text-green-700' : 'bg-amber-100 text-amber-700')}>
-                    {e.meal === 'hot' ? 'Hot Lunch' : 'Sack Lunch'}
-                  </span>
-                  <span className="text-xs font-semibold px-2 py-1 rounded-full bg-primary-50 text-primary-700 capitalize">
-                    {e.milk === 'none' ? 'No Milk' : e.milk + ' Milk'}
-                  </span>
-                </React.Fragment>
-              )}
-            </div>
-          );
-        })}
-      </div>
-
-      <div className="flex justify-end gap-3">
-        <GhostButton onClick={onEdit}>Edit / Go Back</GhostButton>
-        <PrimaryButton onClick={onSubmit}>Save &amp; Submit Final Count</PrimaryButton>
-      </div>
+      {successInfo && (
+        <SuccessModal
+          title={successInfo.stage === 'pre' ? 'Pre-Count Submitted!' : 'Final Count Submitted!'}
+          message={successInfo.stage === 'pre' ? "The morning pre-count has been saved. Come back at lunchtime to complete the final count." : "The lunchtime final count has been saved for today."}
+          onDone={handleDone}
+        />
+      )}
     </div>
   );
 }
@@ -913,6 +1011,9 @@ function FinalReview({ cls, roster, entries, preTotals, onEdit, onSubmit }) {
 /* ============================ ADMIN: VERIFICATION ============================ */
 function VerificationPanel({ data }) {
   const [dateVal, setDateVal] = useState(todayStr());
+  const [expanded, setExpanded] = useState({});
+
+  function toggleExpand(id) { setExpanded(prev => ({ ...prev, [id]: !prev[id] })); }
 
   async function verifyClassroom(cls) {
     const log = data.logsById[logId(dateVal, cls.id)];
@@ -952,18 +1053,32 @@ function VerificationPanel({ data }) {
           {data.classrooms.map(cls => {
             const roster = data.students.filter(s => s.classroomId === cls.id);
             const log = data.logsById[logId(dateVal, cls.id)];
-            const preT = tallyEntries(log && log.pre && log.pre.entries, roster);
-            const finalT = tallyEntries(log && log.final && log.final.entries, roster);
+            const preEntries = (log && log.pre && log.pre.entries) || {};
+            const finalEntries = (log && log.final && log.final.entries) || {};
+            const preT = tallyEntries(preEntries, roster);
+            const finalT = tallyEntries(finalEntries, roster);
             const preSubmitted = !!(log && log.pre && log.pre.submitted);
             const finalSubmitted = !!(log && log.final && log.final.submitted);
             const verified = !!(log && log.verified);
             const status = verified ? 'Verified' : (finalSubmitted ? 'Completed' : (preSubmitted ? 'In Progress' : 'Not Started'));
+
+            const changedStudents = finalSubmitted ? roster.filter(s => entryChanged(preEntries[s.id], finalEntries[s.id])) : [];
+            const summaryDiffs = [];
+            if (finalSubmitted) {
+              [['Hot Lunch','hot'],['Sack Lunch','sack'],['Absent','absent'],['White Milk','white'],['Chocolate Milk','choc']].forEach(([label,key]) => {
+                if (preT[key] !== finalT[key]) {
+                  const delta = finalT[key] - preT[key];
+                  summaryDiffs.push(label + ': ' + preT[key] + ' \u2192 ' + finalT[key] + ' (' + (delta > 0 ? '+' : '') + delta + ')');
+                }
+              });
+            }
+
             return (
               <div key={cls.id} className="bg-white rounded-2xl card-shadow border border-primary-100 p-5">
                 <div className="flex justify-between items-start mb-4 flex-wrap gap-2">
                   <div>
                     <h4 className="font-bold text-primary-900">{classroomLabel(cls)}</h4>
-                    <p className="text-xs font-light text-primary-500">{roster.length} students</p>
+                    <p className="text-xs font-light text-primary-500">{roster.length} students{changedStudents.length > 0 ? ' \u00b7 ' + changedStudents.length + ' changed since morning' : ''}</p>
                   </div>
                   <Badge status={status} />
                 </div>
@@ -977,6 +1092,50 @@ function VerificationPanel({ data }) {
                     <p className="text-sm text-primary-800">Hot {finalT.hot} &middot; Sack {finalT.sack} &middot; Absent {finalT.absent} &middot; White {finalT.white} &middot; Choc. {finalT.choc}</p>
                   </div>
                 </div>
+
+                {finalSubmitted && summaryDiffs.length > 0 && (
+                  <div className="mb-4 bg-amber-50 border border-amber-300 rounded-xl p-3">
+                    <p className="text-xs font-semibold text-amber-800 uppercase mb-1">Changed Since Morning</p>
+                    <p className="text-sm text-amber-800">{summaryDiffs.join(' \u00b7 ')}</p>
+                  </div>
+                )}
+
+                <button onClick={() => toggleExpand(cls.id)} className="text-xs font-semibold text-primary hover:underline mb-3">
+                  {expanded[cls.id] ? 'Hide Student Detail \u25b2' : 'Show Student Detail \u25bc'}
+                </button>
+
+                {expanded[cls.id] && (
+                  <div className="border border-primary-100 rounded-xl overflow-hidden mb-4 overflow-x-auto">
+                    <table className="w-full text-sm">
+                      <thead>
+                        <tr className="bg-primary-50 text-primary-700 text-left">
+                          <th className="p-2 font-semibold">Student</th>
+                          <th className="p-2 font-semibold">Morning</th>
+                          <th className="p-2 font-semibold">Final</th>
+                          <th className="p-2 font-semibold">Milk (Final)</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-primary-50">
+                        {roster.map(s => {
+                          const pe = preEntries[s.id] || defaultEntry();
+                          const fe = finalEntries[s.id] || defaultEntry();
+                          const changed = finalSubmitted && entryChanged(pe, fe);
+                          return (
+                            <tr key={s.id} className={changed ? 'bg-amber-50' : ''}>
+                              <td className="p-2 font-medium text-primary-900">
+                                {s.name}{changed && <span className="ml-1 text-[10px] font-bold text-amber-700 bg-amber-200 px-1.5 py-0.5 rounded-full">Changed</span>}
+                              </td>
+                              <td className="p-2 text-primary-700">{preSubmitted ? entryStatusLabel(pe) : '—'}</td>
+                              <td className="p-2 text-primary-700">{finalSubmitted ? entryStatusLabel(fe) : '—'}</td>
+                              <td className="p-2 text-primary-700">{finalSubmitted ? entryMilkLabel(fe) : '—'}</td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+
                 <div className="flex gap-2 justify-end">
                   {verified ? (
                     <GhostButton onClick={() => unverifyClassroom(cls)}>Unlock (Undo Verification)</GhostButton>
@@ -993,50 +1152,17 @@ function VerificationPanel({ data }) {
   );
 }
 
-/* ============================ ADMIN: TERM & CALENDAR SETTINGS ============================ */
-function TermSettingsPanel({ settings }) {
-  const [semesterStart, setSemesterStart] = useState(settings.semesterStart || '');
-  const [quarterStart, setQuarterStart] = useState(settings.quarterStart || '');
-  const [savedMsg, setSavedMsg] = useState('');
-
-  useEffect(() => {
-    setSemesterStart(settings.semesterStart || '');
-    setQuarterStart(settings.quarterStart || '');
-  }, [settings.semesterStart, settings.quarterStart]);
-
-  async function save() {
-    await saveSettings({ semesterStart, quarterStart });
-    setSavedMsg('Saved!');
-    setTimeout(() => setSavedMsg(''), 2000);
-  }
-
-  return (
-    <div>
-      <h3 className="text-xl font-bold text-primary-900 mb-4">Term &amp; Calendar Settings</h3>
-      <p className="text-sm font-light text-primary-600 mb-4">These dates scope the "This Quarter" and "This Semester" views in Analytics &amp; Reporting.</p>
-      <div className="bg-white rounded-2xl card-shadow border border-primary-100 p-5 flex flex-wrap gap-4 items-end">
-        <div>
-          <label className="text-xs font-medium text-primary-500 uppercase block mb-1">Start of Semester</label>
-          <input type="date" value={semesterStart} onChange={e => setSemesterStart(e.target.value)} className="border-2 border-primary-200 rounded-xl px-3 py-2" />
-        </div>
-        <div>
-          <label className="text-xs font-medium text-primary-500 uppercase block mb-1">Start of Quarter</label>
-          <input type="date" value={quarterStart} onChange={e => setQuarterStart(e.target.value)} className="border-2 border-primary-200 rounded-xl px-3 py-2" />
-        </div>
-        <PrimaryButton onClick={save}>Save Settings</PrimaryButton>
-        {savedMsg && <span className="text-sm font-semibold text-green-600">{savedMsg}</span>}
-      </div>
-    </div>
-  );
-}
-
 /* ============================ ADMIN: ANALYTICS ============================ */
 function AnalyticsDashboard({ data }) {
   const [range, setRange] = useState('daily');
   const [dateVal, setDateVal] = useState(todayStr());
   const [monthVal, setMonthVal] = useState(todayStr().slice(0,7));
+  const [termKey, setTermKey] = useState('Q1');
+  const [customStart, setCustomStart] = useState(todayStr());
+  const [customEnd, setCustomEnd] = useState(todayStr());
 
-  let startDate, endDate, periodLabel;
+  let startDate, endDate, periodLabel, rangeError = null;
+
   if (range === 'daily') {
     startDate = parseDateStr(dateVal); endDate = parseDateStr(dateVal);
     periodLabel = formatDisplayDate(dateVal);
@@ -1046,32 +1172,36 @@ function AnalyticsDashboard({ data }) {
   } else if (range === 'monthly') {
     const mr = getMonthRange(monthVal); startDate = mr.start; endDate = mr.end;
     periodLabel = mr.start.toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
-  } else if (range === 'quarter') {
-    if (!data.settings.quarterStart) { startDate = parseDateStr(todayStr()); endDate = startDate; periodLabel = 'No quarter start date set (Admin \u2192 Term Settings)'; }
-    else { const r = getRangeSince(data.settings.quarterStart, todayStr()); startDate = r.start; endDate = r.end; periodLabel = 'Since ' + formatShortDate(data.settings.quarterStart); }
+  } else if (range === 'quarter' || range === 'semester') {
+    const r = getTermRange(data.settings, termKey);
+    if (!r) {
+      rangeError = 'No dates set for ' + TERM_LABELS[termKey] + ' yet. Set them in Admin \u2192 Term Settings.';
+      startDate = parseDateStr(todayStr()); endDate = startDate; periodLabel = '';
+    } else {
+      startDate = r.start; endDate = r.end;
+      periodLabel = TERM_LABELS[termKey] + ': ' + formatShortDate(toDateStr(r.start)) + ' \u2013 ' + formatShortDate(toDateStr(r.end));
+    }
   } else {
-    if (!data.settings.semesterStart) { startDate = parseDateStr(todayStr()); endDate = startDate; periodLabel = 'No semester start date set (Admin \u2192 Term Settings)'; }
-    else { const r = getRangeSince(data.settings.semesterStart, todayStr()); startDate = r.start; endDate = r.end; periodLabel = 'Since ' + formatShortDate(data.settings.semesterStart); }
+    startDate = parseDateStr(customStart); endDate = parseDateStr(customEnd);
+    if (endDate < startDate) endDate = startDate;
+    periodLabel = formatShortDate(customStart) + ' \u2013 ' + formatShortDate(toDateStr(endDate));
   }
 
   const agg = useMemo(() => aggregateRange(data, startDate, endDate), [data, startDate.getTime(), endDate.getTime()]);
+  const studentAgg = useMemo(() => aggregateRangeByStudent(data, startDate, endDate), [data, startDate.getTime(), endDate.getTime()]);
 
   const overall = useMemo(() => {
     let hot = 0, sack = 0, absent = 0, white = 0, choc = 0;
     Object.values(agg).forEach(v => { hot += v.hot; sack += v.sack; absent += v.absent; white += v.white; choc += v.choc; });
-    const served = hot + sack;
-    const participation = (served + absent) > 0 ? Math.round((served / (served + absent)) * 1000) / 10 : 0;
-    return { hot, sack, absent, white, choc, participation };
+    return { hot, sack, absent, white, choc };
   }, [agg]);
-
-  const maxHot = Math.max(1, ...data.classrooms.map(c => (agg[c.id] ? agg[c.id].hot : 0)));
 
   return (
     <div>
       <h3 className="text-xl font-bold text-primary-900 mb-4">Analytics &amp; Reporting</h3>
 
       <div className="flex flex-wrap gap-2 mb-4">
-        {[['daily','Daily'],['weekly','Weekly'],['monthly','Monthly'],['quarter','This Quarter'],['semester','This Semester']].map(([val,label]) => (
+        {[['daily','Daily'],['weekly','Weekly'],['monthly','Monthly'],['quarter','This Quarter'],['semester','This Semester'],['custom','Custom Date Range']].map(([val,label]) => (
           <button
             key={val}
             onClick={() => setRange(val)}
@@ -1080,65 +1210,145 @@ function AnalyticsDashboard({ data }) {
         ))}
       </div>
 
-      <div className="mb-6 flex items-center gap-3 flex-wrap">
+      <div className="mb-6 flex items-center gap-2 flex-wrap">
         {(range === 'daily' || range === 'weekly') && (
           <input type="date" value={dateVal} onChange={e => setDateVal(e.target.value)} className="border-2 border-primary-200 rounded-xl px-3 py-2" />
         )}
         {range === 'monthly' && (
           <input type="month" value={monthVal} onChange={e => setMonthVal(e.target.value)} className="border-2 border-primary-200 rounded-xl px-3 py-2" />
         )}
-        <span className="text-sm font-light italic text-primary-500">Showing: {periodLabel}</span>
+        {range === 'quarter' && ['Q1','Q2','Q3','Q4'].map(k => (
+          <button key={k} onClick={() => setTermKey(k)} className={"px-3 py-1.5 rounded-lg text-sm font-semibold border-2 " + (termKey === k ? 'bg-primary text-white border-primary' : 'bg-white text-primary-700 border-primary-200')}>{k}</button>
+        ))}
+        {range === 'semester' && ['S1','S2'].map(k => (
+          <button key={k} onClick={() => setTermKey(k)} className={"px-3 py-1.5 rounded-lg text-sm font-semibold border-2 " + (termKey === k ? 'bg-primary text-white border-primary' : 'bg-white text-primary-700 border-primary-200')}>{k}</button>
+        ))}
+        {range === 'custom' && (
+          <React.Fragment>
+            <input type="date" value={customStart} onChange={e => setCustomStart(e.target.value)} className="border-2 border-primary-200 rounded-xl px-3 py-2" />
+            <span className="text-sm text-primary-500">to</span>
+            <input type="date" value={customEnd} onChange={e => setCustomEnd(e.target.value)} className="border-2 border-primary-200 rounded-xl px-3 py-2" />
+          </React.Fragment>
+        )}
+        {!rangeError && <span className="text-sm font-light italic text-primary-500">Showing: {periodLabel}</span>}
       </div>
 
-      <div className="grid grid-cols-2 sm:grid-cols-5 gap-3 mb-8">
-        <StatCard label="Hot Lunches" value={overall.hot} />
-        <StatCard label="Sack Lunches" value={overall.sack} />
-        <StatCard label="Absences" value={overall.absent} />
-        <StatCard label="White Milk" value={overall.white} />
-        <StatCard label="Choc. Milk" value={overall.choc} />
-      </div>
+      {rangeError ? (
+        <div className="bg-amber-50 border border-amber-300 text-amber-800 rounded-xl p-4 text-sm font-medium mb-6">{rangeError}</div>
+      ) : (
+        <React.Fragment>
+          <div className="grid grid-cols-2 sm:grid-cols-5 gap-3 mb-8">
+            <StatCard label="Hot Lunches" value={overall.hot} />
+            <StatCard label="Sack Lunches" value={overall.sack} />
+            <StatCard label="Absences" value={overall.absent} />
+            <StatCard label="White Milk" value={overall.white} />
+            <StatCard label="Choc. Milk" value={overall.choc} />
+          </div>
 
-      <div className="bg-white rounded-2xl card-shadow border border-primary-100 p-5 mb-8">
-        <h4 className="font-semibold text-primary-800 mb-3">Hot Lunches by Classroom</h4>
-        {data.classrooms.length === 0 ? (
-          <p className="text-sm font-light text-primary-500">No classrooms yet.</p>
-        ) : data.classrooms.map(c => (
-          <BarRow key={c.id} label={classroomLabel(c)} value={agg[c.id] ? agg[c.id].hot : 0} max={maxHot} color="#3a5299" />
+          {data.classrooms.length === 0 ? (
+            <p className="text-sm font-light text-primary-500">No classrooms yet.</p>
+          ) : (
+            <div className="grid gap-4">
+              {data.classrooms.map(c => {
+                const v = agg[c.id] || { hot: 0, sack: 0, absent: 0, white: 0, choc: 0 };
+                const roster = data.students.filter(s => s.classroomId === c.id);
+                return (
+                  <div key={c.id} className="bg-white rounded-2xl card-shadow border border-primary-100 p-5">
+                    <div className="flex justify-between items-start mb-3 flex-wrap gap-2">
+                      <div>
+                        <h4 className="font-bold text-primary-900">{classroomLabel(c)}</h4>
+                        <p className="text-xs font-light text-primary-500">{roster.length} students</p>
+                      </div>
+                      <p className="text-sm text-primary-700 font-medium">Hot {v.hot} &middot; Sack {v.sack} &middot; Absent {v.absent} &middot; White {v.white} &middot; Choc. {v.choc}</p>
+                    </div>
+                    {roster.length > 0 && (
+                      <div className="border-t border-primary-50 pt-3 mt-2">
+                        <p className="text-xs font-semibold text-primary-500 uppercase mb-2">Student Detail</p>
+                        <div className="divide-y divide-primary-50">
+                          {roster.map(s => {
+                            const sv = studentAgg[s.id] || { hot: 0, sack: 0, absent: 0, white: 0, choc: 0 };
+                            return (
+                              <div key={s.id} className="flex items-center gap-3 py-2">
+                                <Avatar name={s.name} size={32} />
+                                <p className="font-medium text-primary-900 flex-1 min-w-0 truncate text-sm">{s.name}</p>
+                                <p className="text-xs text-primary-600 font-light">Hot {sv.hot} &middot; Sack {sv.sack} &middot; Absent {sv.absent} &middot; White {sv.white} &middot; Choc. {sv.choc}</p>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </React.Fragment>
+      )}
+    </div>
+  );
+}
+
+/* ============================ ADMIN: TERM & CALENDAR SETTINGS ============================ */
+function TermSettingsPanel({ settings }) {
+  const terms = settings.terms || {};
+  const [activeTerm, setActiveTerm] = useState('Q1');
+  const [start, setStart] = useState((terms.Q1 && terms.Q1.start) || '');
+  const [end, setEnd] = useState((terms.Q1 && terms.Q1.end) || '');
+  const [savedMsg, setSavedMsg] = useState('');
+
+  useEffect(() => {
+    const t = terms[activeTerm] || {};
+    setStart(t.start || '');
+    setEnd(t.end || '');
+    // eslint-disable-next-line
+  }, [activeTerm, settings.terms]);
+
+  async function save() {
+    const newTerms = { ...terms, [activeTerm]: { start, end } };
+    await saveSettings({ terms: newTerms });
+    setSavedMsg('Saved!');
+    setTimeout(() => setSavedMsg(''), 2000);
+  }
+
+  return (
+    <div>
+      <h3 className="text-xl font-bold text-primary-900 mb-4">Term &amp; Calendar Settings</h3>
+      <p className="text-sm font-light text-primary-600 mb-4">Set the start and end date for each term. These dates power "This Quarter" / "This Semester" in Analytics, and the Quarter / Semester / School Year exports.</p>
+
+      <div className="flex flex-wrap gap-2 mb-4">
+        {TERM_KEYS.map(k => (
+          <button
+            key={k}
+            onClick={() => setActiveTerm(k)}
+            className={"px-4 py-2 rounded-xl font-semibold text-sm border-2 transition-fast " + (activeTerm === k ? 'bg-primary text-white border-primary' : 'bg-white text-primary-700 border-primary-200 hover:bg-primary-50')}
+          >{k}</button>
         ))}
       </div>
 
-      <div className="bg-white rounded-2xl card-shadow border border-primary-100 overflow-x-auto">
-        <table className="w-full text-sm">
-          <thead>
-            <tr className="bg-primary-50 text-primary-700 text-left">
-              <th className="p-3 font-semibold">Classroom</th>
-              <th className="p-3 font-semibold text-right">Days Logged</th>
-              <th className="p-3 font-semibold text-right">Hot</th>
-              <th className="p-3 font-semibold text-right">Sack</th>
-              <th className="p-3 font-semibold text-right">Absent</th>
-              <th className="p-3 font-semibold text-right">White Milk</th>
-              <th className="p-3 font-semibold text-right">Choc. Milk</th>
-              <th className="p-3 font-semibold text-right">Verified Days</th>
-            </tr>
-          </thead>
-          <tbody className="divide-y divide-primary-50">
-            {data.classrooms.map(c => {
-              const v = agg[c.id] || { hot: 0, sack: 0, absent: 0, white: 0, choc: 0, daysLogged: 0, daysVerified: 0 };
-              return (
-                <tr key={c.id}>
-                  <td className="p-3 font-medium text-primary-900">{classroomLabel(c)}</td>
-                  <td className="p-3 text-right">{v.daysLogged}</td>
-                  <td className="p-3 text-right">{v.hot}</td>
-                  <td className="p-3 text-right">{v.sack}</td>
-                  <td className="p-3 text-right">{v.absent}</td>
-                  <td className="p-3 text-right">{v.white}</td>
-                  <td className="p-3 text-right">{v.choc}</td>
-                  <td className="p-3 text-right">{v.daysVerified}</td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
+      <div className="bg-white rounded-2xl card-shadow border border-primary-100 p-5 flex flex-wrap gap-4 items-end">
+        <div>
+          <label className="text-xs font-medium text-primary-500 uppercase block mb-1">{TERM_LABELS[activeTerm]} Start Date</label>
+          <input type="date" value={start} onChange={e => setStart(e.target.value)} className="border-2 border-primary-200 rounded-xl px-3 py-2" />
+        </div>
+        <div>
+          <label className="text-xs font-medium text-primary-500 uppercase block mb-1">{TERM_LABELS[activeTerm]} End Date</label>
+          <input type="date" value={end} onChange={e => setEnd(e.target.value)} className="border-2 border-primary-200 rounded-xl px-3 py-2" />
+        </div>
+        <PrimaryButton onClick={save}>Save {TERM_LABELS[activeTerm]}</PrimaryButton>
+        {savedMsg && <span className="text-sm font-semibold text-green-600">{savedMsg}</span>}
+      </div>
+
+      <div className="mt-6 bg-primary-50 rounded-2xl p-4">
+        <p className="text-xs font-semibold text-primary-700 uppercase mb-2">All Configured Terms</p>
+        <div className="grid sm:grid-cols-2 gap-2 text-sm text-primary-800">
+          {TERM_KEYS.map(k => {
+            const t = terms[k];
+            return (
+              <p key={k}><span className="font-semibold">{TERM_LABELS[k]}:</span> {(t && t.start) ? formatShortDate(t.start) : '—'} to {(t && t.end) ? formatShortDate(t.end) : '—'}</p>
+            );
+          })}
+        </div>
       </div>
     </div>
   );
@@ -1150,6 +1360,14 @@ function StudentManagement({ data }) {
   const [newClass, setNewClass] = useState(data.classrooms[0] ? data.classrooms[0].id : '');
   const [editingId, setEditingId] = useState(null);
   const [editName, setEditName] = useState('');
+
+  const [search, setSearch] = useState('');
+  const [filterClassroom, setFilterClassroom] = useState('');
+  const [sortBy, setSortBy] = useState('name');
+
+  const [importRows, setImportRows] = useState(null);
+  const [importBusy, setImportBusy] = useState(false);
+  const fileInputRef = useRef(null);
 
   useEffect(() => {
     if (!newClass && data.classrooms[0]) setNewClass(data.classrooms[0].id);
@@ -1182,6 +1400,70 @@ function StudentManagement({ data }) {
     setEditingId(null);
   }
 
+  const visibleClassrooms = useMemo(() => {
+    let list = data.classrooms.slice();
+    if (filterClassroom) list = list.filter(c => c.id === filterClassroom);
+    if (sortBy === 'classroom') list.sort((a,b) => classroomLabel(a).localeCompare(classroomLabel(b)));
+    if (sortBy === 'grade') list.sort((a,b) => a.grade.localeCompare(b.grade));
+    return list;
+  }, [data.classrooms, filterClassroom, sortBy]);
+
+  function studentsFor(classroomId) {
+    let list = data.students.filter(s => s.classroomId === classroomId);
+    if (search.trim()) {
+      const q = search.trim().toLowerCase();
+      list = list.filter(s => s.name.toLowerCase().includes(q));
+    }
+    return list.slice().sort((a,b) => a.name.localeCompare(b.name));
+  }
+
+  function handleFileSelected(e) {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (evt) => {
+      try {
+        const wb = XLSX.read(evt.target.result, { type: 'array' });
+        const sheet = wb.Sheets[wb.SheetNames[0]];
+        const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '' });
+        if (!rows.length) { alert('That file appears to be empty.'); return; }
+        const header = rows[0].map(h => String(h).trim().toLowerCase());
+        const nameIdx = header.indexOf('name');
+        const gradeIdx = header.indexOf('grade');
+        const teacherIdx = header.indexOf('teacher');
+        if (nameIdx === -1 || gradeIdx === -1 || teacherIdx === -1) {
+          alert('The file must have a header row with columns: Name, Grade, Teacher');
+          return;
+        }
+        const parsed = rows.slice(1).filter(r => r.length && String(r[nameIdx]).trim()).map(r => {
+          const name = String(r[nameIdx]).trim();
+          const grade = String(r[gradeIdx]).trim();
+          const teacher = String(r[teacherIdx]).trim();
+          const match = data.classrooms.find(c => c.grade.trim().toLowerCase() === grade.toLowerCase() && c.teacher.trim().toLowerCase() === teacher.toLowerCase());
+          return { name, grade, teacher, classroomId: match ? match.id : null };
+        });
+        setImportRows(parsed);
+      } catch (err) {
+        console.error(err);
+        alert('Could not read that file. Please upload a CSV or Excel (.xlsx) file with columns: Name, Grade, Teacher.');
+      }
+    };
+    reader.readAsArrayBuffer(file);
+  }
+
+  async function confirmImport() {
+    if (!importRows) return;
+    setImportBusy(true);
+    const matched = importRows.filter(r => r.classroomId);
+    for (const r of matched) {
+      await saveStudent({ name: r.name, classroomId: r.classroomId });
+    }
+    setImportBusy(false);
+    setImportRows(null);
+    if (fileInputRef.current) fileInputRef.current.value = '';
+    alert('Imported ' + matched.length + ' student(s).');
+  }
+
   return (
     <div>
       <h3 className="text-xl font-bold text-primary-900 mb-4">Student Management</h3>
@@ -1189,7 +1471,7 @@ function StudentManagement({ data }) {
       {data.classrooms.length === 0 ? (
         <p className="text-sm font-light text-primary-500 mb-4">Add a classroom first before adding students.</p>
       ) : (
-        <form onSubmit={addStudent} className="bg-white rounded-2xl card-shadow p-4 border border-primary-100 mb-6 flex flex-wrap gap-3 items-end">
+        <form onSubmit={addStudent} className="bg-white rounded-2xl card-shadow p-4 border border-primary-100 mb-4 flex flex-wrap gap-3 items-end">
           <div className="flex-1 min-w-[180px]">
             <label className="text-xs font-medium text-primary-500 uppercase">New Student Name</label>
             <input value={newName} onChange={e => setNewName(e.target.value)} placeholder="e.g. Grace Miller" className="w-full border-2 border-primary-200 rounded-xl px-3 py-2 mt-1 focus:outline-none focus:border-primary" />
@@ -1204,31 +1486,101 @@ function StudentManagement({ data }) {
         </form>
       )}
 
-      <div className="bg-white rounded-2xl card-shadow border border-primary-100 divide-y divide-primary-50 overflow-hidden">
-        {data.students.length === 0 && <p className="p-4 text-sm font-light text-primary-500">No students yet.</p>}
-        {data.students.map(s => (
-          <div key={s.id} className="flex items-center gap-3 p-4 flex-wrap">
-            <Avatar name={s.name} size={40} />
-            {editingId === s.id ? (
-              <input value={editName} onChange={e => setEditName(e.target.value)} className="border-2 border-primary-200 rounded-lg px-2 py-1 flex-1 min-w-[140px]" autoFocus />
-            ) : (
-              <p className="font-medium text-primary-900 flex-1 min-w-[140px]">{s.name}</p>
-            )}
-            <select
-              value={s.classroomId}
-              onChange={e => moveStudent(s.id, e.target.value)}
-              className="border-2 border-primary-200 rounded-lg px-2 py-1 text-sm"
-            >
-              {data.classrooms.map(c => <option key={c.id} value={c.id}>{classroomLabel(c)}</option>)}
-            </select>
-            {editingId === s.id ? (
-              <button onClick={() => saveEdit(s.id)} className="px-3 py-1.5 rounded-lg bg-primary text-white text-sm font-semibold">Save</button>
-            ) : (
-              <button onClick={() => startEdit(s)} className="px-3 py-1.5 rounded-lg bg-primary-50 text-primary text-sm font-semibold hover:bg-primary-100">Edit</button>
-            )}
-            <button onClick={() => deleteStudent(s.id)} className="px-3 py-1.5 rounded-lg bg-rose-50 text-rose-600 text-sm font-semibold hover:bg-rose-100">Delete</button>
+      <div className="bg-white rounded-2xl card-shadow p-4 border border-primary-100 mb-6">
+        <p className="text-sm font-semibold text-primary-800 mb-2">Batch Upload Roster (CSV or Excel)</p>
+        <p className="text-xs font-light text-primary-500 mb-3">File must include a header row with columns named exactly: <span className="font-semibold">Name</span>, <span className="font-semibold">Grade</span>, <span className="font-semibold">Teacher</span>. Grade and Teacher must match an existing classroom.</p>
+        <input ref={fileInputRef} type="file" accept=".csv,.xlsx,.xls" onChange={handleFileSelected} className="text-sm" />
+        {importRows && (
+          <div className="mt-4 border border-primary-100 rounded-xl overflow-hidden overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="bg-primary-50 text-primary-700 text-left">
+                  <th className="p-2 font-semibold">Name</th>
+                  <th className="p-2 font-semibold">Grade</th>
+                  <th className="p-2 font-semibold">Teacher</th>
+                  <th className="p-2 font-semibold">Match</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-primary-50">
+                {importRows.map((r,i) => (
+                  <tr key={i} className={!r.classroomId ? 'bg-rose-50' : ''}>
+                    <td className="p-2">{r.name}</td>
+                    <td className="p-2">{r.grade}</td>
+                    <td className="p-2">{r.teacher}</td>
+                    <td className="p-2">{r.classroomId ? <span className="text-green-700 font-semibold">Matched</span> : <span className="text-rose-600 font-semibold">No matching classroom</span>}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            <div className="p-3 flex justify-end gap-2 bg-primary-50">
+              <GhostButton onClick={() => { setImportRows(null); if (fileInputRef.current) fileInputRef.current.value = ''; }}>Cancel</GhostButton>
+              <PrimaryButton disabled={importBusy} onClick={confirmImport}>{importBusy ? 'Importing…' : 'Confirm Import (' + importRows.filter(r => r.classroomId).length + ')'}</PrimaryButton>
+            </div>
           </div>
-        ))}
+        )}
+      </div>
+
+      <div className="flex flex-wrap gap-3 mb-4 items-end">
+        <div className="flex-1 min-w-[180px]">
+          <label className="text-xs font-medium text-primary-500 uppercase block mb-1">Search Students</label>
+          <input value={search} onChange={e => setSearch(e.target.value)} placeholder="Search by name…" className="w-full border-2 border-primary-200 rounded-xl px-3 py-2 focus:outline-none focus:border-primary" />
+        </div>
+        <div>
+          <label className="text-xs font-medium text-primary-500 uppercase block mb-1">Filter by Classroom</label>
+          <select value={filterClassroom} onChange={e => setFilterClassroom(e.target.value)} className="border-2 border-primary-200 rounded-xl px-3 py-2">
+            <option value="">All Classrooms</option>
+            {data.classrooms.map(c => <option key={c.id} value={c.id}>{classroomLabel(c)}</option>)}
+          </select>
+        </div>
+        <div>
+          <label className="text-xs font-medium text-primary-500 uppercase block mb-1">Sort Groups By</label>
+          <select value={sortBy} onChange={e => setSortBy(e.target.value)} className="border-2 border-primary-200 rounded-xl px-3 py-2">
+            <option value="name">Original Order</option>
+            <option value="classroom">Classroom Name (A–Z)</option>
+            <option value="grade">Grade (A–Z)</option>
+          </select>
+        </div>
+      </div>
+
+      <div className="grid gap-5">
+        {visibleClassrooms.length === 0 && <p className="text-sm font-light text-primary-500">No classrooms match.</p>}
+        {visibleClassrooms.map(c => {
+          const students = studentsFor(c.id);
+          if (search.trim() && students.length === 0) return null;
+          return (
+            <div key={c.id} className="bg-white rounded-2xl card-shadow border border-primary-100 overflow-hidden">
+              <div className="bg-primary-50 px-4 py-2.5 border-b border-primary-100">
+                <h4 className="font-bold text-primary-900 text-sm">{classroomLabel(c)}</h4>
+              </div>
+              <div className="divide-y divide-primary-50">
+                {students.length === 0 && <p className="p-4 text-sm font-light text-primary-500">No students.</p>}
+                {students.map(s => (
+                  <div key={s.id} className="flex items-center gap-3 p-4 flex-wrap">
+                    <Avatar name={s.name} size={40} />
+                    {editingId === s.id ? (
+                      <input value={editName} onChange={e => setEditName(e.target.value)} className="border-2 border-primary-200 rounded-lg px-2 py-1 flex-1 min-w-[140px]" autoFocus />
+                    ) : (
+                      <p className="font-medium text-primary-900 flex-1 min-w-[140px]">{s.name}</p>
+                    )}
+                    <select
+                      value={s.classroomId}
+                      onChange={e => moveStudent(s.id, e.target.value)}
+                      className="border-2 border-primary-200 rounded-lg px-2 py-1 text-sm"
+                    >
+                      {data.classrooms.map(cc => <option key={cc.id} value={cc.id}>{classroomLabel(cc)}</option>)}
+                    </select>
+                    {editingId === s.id ? (
+                      <button onClick={() => saveEdit(s.id)} className="px-3 py-1.5 rounded-lg bg-primary text-white text-sm font-semibold">Save</button>
+                    ) : (
+                      <button onClick={() => startEdit(s)} className="px-3 py-1.5 rounded-lg bg-primary-50 text-primary text-sm font-semibold hover:bg-primary-100">Edit</button>
+                    )}
+                    <button onClick={() => deleteStudent(s.id)} className="px-3 py-1.5 rounded-lg bg-rose-50 text-rose-600 text-sm font-semibold hover:bg-rose-100">Delete</button>
+                  </div>
+                ))}
+              </div>
+            </div>
+          );
+        })}
       </div>
     </div>
   );
@@ -1309,58 +1661,113 @@ function ClassroomManagement({ data }) {
   );
 }
 
-/* ============================ ADMIN: EXPORT (GOOGLE SHEETS) ============================ */
+/* ============================ ADMIN: EXPORT ============================ */
 function ExportPanel({ data }) {
-  const [dailyDate, setDailyDate] = useState(todayStr());
-  const [weeklyDate, setWeeklyDate] = useState(todayStr());
-  const [monthlyMonth, setMonthlyMonth] = useState(todayStr().slice(0,7));
+  const [rangeType, setRangeType] = useState('daily');
+  const [dateVal, setDateVal] = useState(todayStr());
+  const [monthVal, setMonthVal] = useState(todayStr().slice(0,7));
+  const [termKey, setTermKey] = useState('Q1');
+  const [customStart, setCustomStart] = useState(todayStr());
+  const [customEnd, setCustomEnd] = useState(todayStr());
+  const [format, setFormat] = useState('xlsx');
 
-  function exportDaily() {
-    const rows = buildDailyExportRows(data, dailyDate);
-    downloadTSV('lunch-daily-' + dailyDate + '.tsv', rows);
+  const rangeOptions = [
+    ['daily','Daily'],
+    ['weekly','Weekly'],
+    ['monthly','Monthly'],
+    ['quarter','By Quarter'],
+    ['semester','By Semester'],
+    ['schoolyear','By School Year'],
+    ['ytd','Start of School Year to Now'],
+    ['custom','Custom Date Range']
+  ];
+
+  function computeRange() {
+    if (rangeType === 'daily') {
+      const d = parseDateStr(dateVal);
+      return { start: d, end: d, label: formatDisplayDate(dateVal), filePart: dateVal };
+    }
+    if (rangeType === 'weekly') {
+      const wr = getWeekRange(dateVal);
+      return { start: wr.start, end: wr.end, label: 'Week of ' + formatShortDate(toDateStr(wr.start)), filePart: 'week-' + toDateStr(wr.start) };
+    }
+    if (rangeType === 'monthly') {
+      const mr = getMonthRange(monthVal);
+      return { start: mr.start, end: mr.end, label: mr.start.toLocaleDateString('en-US', { month: 'long', year: 'numeric' }), filePart: monthVal };
+    }
+    if (rangeType === 'quarter' || rangeType === 'semester') {
+      const r = getTermRange(data.settings, termKey);
+      if (!r) return null;
+      return { start: r.start, end: r.end, label: TERM_LABELS[termKey], filePart: termKey };
+    }
+    if (rangeType === 'schoolyear') {
+      const r = getSchoolYearRange(data.settings);
+      if (!r) return null;
+      return { start: r.start, end: r.end, label: 'Full School Year', filePart: 'school-year' };
+    }
+    if (rangeType === 'ytd') {
+      const r = getStartOfYearToNow(data.settings);
+      if (!r) return null;
+      return { start: r.start, end: r.end, label: 'Start of School Year \u2013 Today', filePart: 'ytd' };
+    }
+    let s = parseDateStr(customStart), e = parseDateStr(customEnd);
+    if (e < s) e = s;
+    return { start: s, end: e, label: formatShortDate(customStart) + ' \u2013 ' + formatShortDate(toDateStr(e)), filePart: customStart + '_to_' + toDateStr(e) };
   }
-  function exportWeekly() {
-    const rows = buildWeeklyExportRows(data, weeklyDate);
-    const wr = getWeekRange(weeklyDate);
-    downloadTSV('lunch-weekly-' + toDateStr(wr.start) + '.tsv', rows);
-  }
-  function exportMonthly() {
-    const rows = buildMonthlyExportRows(data, monthlyMonth);
-    downloadTSV('lunch-monthly-' + monthlyMonth + '.tsv', rows);
+
+  function runExport() {
+    const r = computeRange();
+    if (!r) { alert('That date range has not been configured yet. Set it in Admin \u2192 Term Settings.'); return; }
+    const rows = buildRangeExportRows(data, r.start, r.end, r.label);
+    const filename = 'lunch-count-export-' + r.filePart;
+    if (format === 'xlsx') downloadXLSX(filename + '.xlsx', rows);
+    else downloadCSV(filename + '.csv', rows);
   }
 
   return (
-    <div className="space-y-8">
-      <p className="text-sm font-light text-primary-600">
-        Each report downloads as a .tsv (tab-separated) file. Open it directly, or in Google Sheets choose
-        File &rarr; Import &rarr; Upload and select "Tab" as the separator for a clean import.
-      </p>
+    <div>
+      <h3 className="text-xl font-bold text-primary-900 mb-4">Lunch Count Export</h3>
+      <p className="text-sm font-light text-primary-600 mb-6">Choose a date range and download a classroom-by-classroom and student-by-student breakdown of final lunch counts.</p>
 
       <div className="bg-white rounded-2xl card-shadow border border-primary-100 p-5">
-        <h3 className="text-lg font-bold text-primary-900 mb-2">Daily Final Export</h3>
-        <p className="text-sm font-light text-primary-600 mb-3">Student-level final counts plus a pre-count vs. final-count summary.</p>
-        <div className="flex items-center gap-3 flex-wrap">
-          <input type="date" value={dailyDate} onChange={e => setDailyDate(e.target.value)} className="border-2 border-primary-200 rounded-xl px-3 py-2" />
-          <PrimaryButton onClick={exportDaily}>Download Daily Export</PrimaryButton>
+        <p className="text-xs font-semibold text-primary-500 uppercase mb-2">Date Range</p>
+        <div className="flex flex-wrap gap-2 mb-4">
+          {rangeOptions.map(([val,label]) => (
+            <button
+              key={val}
+              onClick={() => setRangeType(val)}
+              className={"px-4 py-2 rounded-xl font-semibold text-sm border-2 transition-fast " + (rangeType === val ? 'bg-primary text-white border-primary' : 'bg-white text-primary-700 border-primary-200 hover:bg-primary-50')}
+            >{label}</button>
+          ))}
         </div>
-      </div>
 
-      <div className="bg-white rounded-2xl card-shadow border border-primary-100 p-5">
-        <h3 className="text-lg font-bold text-primary-900 mb-2">Weekly Export</h3>
-        <p className="text-sm font-light text-primary-600 mb-3">Daily breakdown per student for the selected week, with weekly summary totals.</p>
-        <div className="flex items-center gap-3 flex-wrap">
-          <input type="date" value={weeklyDate} onChange={e => setWeeklyDate(e.target.value)} className="border-2 border-primary-200 rounded-xl px-3 py-2" />
-          <PrimaryButton onClick={exportWeekly}>Download Weekly Export</PrimaryButton>
+        <div className="flex flex-wrap gap-3 items-center mb-4">
+          {rangeType === 'daily' && <input type="date" value={dateVal} onChange={e => setDateVal(e.target.value)} className="border-2 border-primary-200 rounded-xl px-3 py-2" />}
+          {rangeType === 'weekly' && <input type="date" value={dateVal} onChange={e => setDateVal(e.target.value)} className="border-2 border-primary-200 rounded-xl px-3 py-2" />}
+          {rangeType === 'monthly' && <input type="month" value={monthVal} onChange={e => setMonthVal(e.target.value)} className="border-2 border-primary-200 rounded-xl px-3 py-2" />}
+          {rangeType === 'quarter' && ['Q1','Q2','Q3','Q4'].map(k => (
+            <button key={k} onClick={() => setTermKey(k)} className={"px-3 py-1.5 rounded-lg text-sm font-semibold border-2 " + (termKey === k ? 'bg-primary text-white border-primary' : 'bg-white text-primary-700 border-primary-200')}>{k}</button>
+          ))}
+          {rangeType === 'semester' && ['S1','S2'].map(k => (
+            <button key={k} onClick={() => setTermKey(k)} className={"px-3 py-1.5 rounded-lg text-sm font-semibold border-2 " + (termKey === k ? 'bg-primary text-white border-primary' : 'bg-white text-primary-700 border-primary-200')}>{k}</button>
+          ))}
+          {rangeType === 'custom' && (
+            <React.Fragment>
+              <input type="date" value={customStart} onChange={e => setCustomStart(e.target.value)} className="border-2 border-primary-200 rounded-xl px-3 py-2" />
+              <span className="text-sm text-primary-500">to</span>
+              <input type="date" value={customEnd} onChange={e => setCustomEnd(e.target.value)} className="border-2 border-primary-200 rounded-xl px-3 py-2" />
+            </React.Fragment>
+          )}
         </div>
-      </div>
 
-      <div className="bg-white rounded-2xl card-shadow border border-primary-100 p-5">
-        <h3 className="text-lg font-bold text-primary-900 mb-2">Monthly Export</h3>
-        <p className="text-sm font-light text-primary-600 mb-3">Week-by-week breakdown per student across the month, with monthly summary totals.</p>
-        <div className="flex items-center gap-3 flex-wrap">
-          <input type="month" value={monthlyMonth} onChange={e => setMonthlyMonth(e.target.value)} className="border-2 border-primary-200 rounded-xl px-3 py-2" />
-          <PrimaryButton onClick={exportMonthly}>Download Monthly Export</PrimaryButton>
+        <p className="text-xs font-semibold text-primary-500 uppercase mb-2">File Format</p>
+        <div className="flex gap-2 mb-5">
+          {[['xlsx','Excel (.xlsx)'],['csv','CSV (.csv)']].map(([val,label]) => (
+            <button key={val} onClick={() => setFormat(val)} className={"px-4 py-2 rounded-xl font-semibold text-sm border-2 transition-fast " + (format === val ? 'bg-primary text-white border-primary' : 'bg-white text-primary-700 border-primary-200 hover:bg-primary-50')}>{label}</button>
+          ))}
         </div>
+
+        <PrimaryButton onClick={runExport}>Download Export</PrimaryButton>
       </div>
     </div>
   );
@@ -1368,13 +1775,13 @@ function ExportPanel({ data }) {
 
 /* ============================ ADMIN PANEL ============================ */
 function AdminPanel({ data, authUser, onLogout }) {
-  const [tab, setTab] = useState('verification');
+  const [tab, setTab] = useState('analytics');
   const tabs = [
-    ['verification', 'Verification'],
     ['analytics', 'Analytics'],
-    ['settings', 'Term Settings'],
-    ['students', 'Students'],
+    ['verification', 'Verification'],
     ['classrooms', 'Classrooms'],
+    ['students', 'Students'],
+    ['settings', 'Term Settings'],
     ['export', 'Export']
   ];
   return (
@@ -1396,11 +1803,11 @@ function AdminPanel({ data, authUser, onLogout }) {
         ))}
       </div>
 
-      {tab === 'verification' && <VerificationPanel data={data} />}
       {tab === 'analytics' && <AnalyticsDashboard data={data} />}
-      {tab === 'settings' && <TermSettingsPanel settings={data.settings} />}
-      {tab === 'students' && <StudentManagement data={data} />}
+      {tab === 'verification' && <VerificationPanel data={data} />}
       {tab === 'classrooms' && <ClassroomManagement data={data} />}
+      {tab === 'students' && <StudentManagement data={data} />}
+      {tab === 'settings' && <TermSettingsPanel settings={data.settings} />}
       {tab === 'export' && <ExportPanel data={data} />}
     </div>
   );
@@ -1470,7 +1877,7 @@ function ConnectedApp() {
 
   return (
     <div className="min-h-screen">
-      <NavBar role={role} onRequestRole={requestRole} currentDate={todayStr()} />
+      <NavBar role={role} onRequestRole={requestRole} />
 
       {showLogin && (
         <AdminLoginModal
@@ -1501,26 +1908,30 @@ function ConnectedApp() {
       )}
 
       <footer className="text-center text-xs font-light text-primary-400 py-8">
-        Counting Loaves | Lunch Tracker &middot; Made only for St. Mary Catholic School, Garden City, KS
+        <p>Counting Loaves · Lunch Counter App</p>
+        <p className="mt-1">Made only for St. Mary Catholic School</p>
       </footer>
     </div>
   );
 }
 
 function App() {
-  if (FIREBASE_NOT_CONFIGURED) {
-    return (
-      <div className="min-h-screen">
-        <div className="bg-primary text-white">
-          <div className="max-w-6xl mx-auto px-4 sm:px-6 py-4">
-            <h1 className="text-2xl font-bold leading-tight">\uD83C\uDF7D\uFE0F Lunch Tracker</h1>
+  return (
+    <DailyPasswordGate>
+      {FIREBASE_NOT_CONFIGURED ? (
+        <div className="min-h-screen">
+          <div className="bg-primary text-white">
+            <div className="max-w-6xl mx-auto px-4 sm:px-6 py-4">
+              <h1 className="text-2xl font-bold leading-tight">🍞 Counting Loaves</h1>
+            </div>
           </div>
+          <SetupRequiredScreen />
         </div>
-        <SetupRequiredScreen />
-      </div>
-    );
-  }
-  return <ConnectedApp />;
+      ) : (
+        <ConnectedApp />
+      )}
+    </DailyPasswordGate>
+  );
 }
 
 const root = ReactDOM.createRoot(document.getElementById('root'));
