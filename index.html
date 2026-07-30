@@ -37,6 +37,10 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+<!-- Firebase (compat SDKs so they work with plain <script> tags, no bundler required) -->
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
 <style>
   * { font-family: 'Fira Sans', sans-serif; }
   body { background-color: #fdf8f2; }
@@ -53,44 +57,61 @@
 <div id="root"></div>
 
 <script type="text/babel" data-presets="react">
-const { useState, useEffect, useMemo, useCallback } = React;
+const { useState, useEffect, useMemo } = React;
+
+/* ============================ FIREBASE CONFIGURATION ============================ */
+// TODO: replace with your Firebase project's web app config.
+// 1. Create a project at https://console.firebase.google.com
+// 2. Enable "Cloud Firestore" (Build > Firestore Database)
+// 3. Enable "Authentication" > Sign-in method > Email/Password
+// 4. Add at least one admin user under Authentication > Users
+// 5. Copy the config object from Project Settings > General > Your apps > SDK setup
+const firebaseConfig = {
+  apiKey: "AIzaSyDG_8ye42ss0VT1WgS4HjVjJxk_9t1Om_0",
+  authDomain: "counting-loaves.firebaseapp.com",
+  projectId: "counting-loaves",
+  storageBucket: "counting-loaves.firebasestorage.app",
+  messagingSenderId: "634372628765",
+  appId: "1:634372628765:web:4c6c9266c19cc3e126c1f4"
+};
+
+/*
+  Suggested Firestore security rules (Firebase Console > Firestore > Rules):
+
+  rules_version = '2';
+  service cloud.firestore {
+    match /databases/{database}/documents {
+      match /classrooms/{id} { allow read: if true; allow write: if request.auth != null; }
+      match /students/{id}   { allow read: if true; allow write: if request.auth != null; }
+      match /settings/{id}   { allow read: if true; allow write: if request.auth != null; }
+      match /logs/{id}       { allow read: if true; allow write: if true; }
+    }
+  }
+
+  This lets any teacher device read/write daily counts without signing in, while
+  classroom rosters, student rosters, and term settings can only be changed by an
+  authenticated admin. Consider tightening further (e.g. Firebase App Check, or
+  requiring auth on log writes too) before using this in production.
+*/
+
+const FIREBASE_NOT_CONFIGURED = firebaseConfig.apiKey === 'YOUR_API_KEY';
+
+let db = null;
+let auth = null;
+if (!FIREBASE_NOT_CONFIGURED) {
+  firebase.initializeApp(firebaseConfig);
+  db = firebase.firestore();
+  auth = firebase.auth();
+}
 
 /* ============================ CONSTANTS ============================ */
-const STORAGE_KEY = 'lunchTrackerData_v1';
-const ADMIN_PASSWORD = 'admin123';
 const AVATAR_COLORS = ['#3a5299','#5f78b2','#8fa2d0','#c98a3a','#3a9970','#993a5e','#8a3a99','#3a8f99'];
-
-const INITIAL_CLASSROOMS = [
-  { id: 'c1', name: 'Room 101', grade: 'Kindergarten', teacher: 'Ms. Alvarez' },
-  { id: 'c2', name: 'Room 204', grade: '3rd Grade', teacher: 'Mr. Whitfield' },
-  { id: 'c3', name: 'Room 315', grade: '5th Grade', teacher: 'Mrs. Chen' }
-];
-
-const INITIAL_STUDENTS = [
-  { id: 's1', name: 'Ava Thompson', classroomId: 'c1' },
-  { id: 's2', name: 'Liam Rodriguez', classroomId: 'c1' },
-  { id: 's3', name: 'Sophia Patel', classroomId: 'c1' },
-  { id: 's4', name: 'Noah Kim', classroomId: 'c1' },
-  { id: 's5', name: 'Mia Johnson', classroomId: 'c1' },
-  { id: 's6', name: 'Ethan Brooks', classroomId: 'c1' },
-  { id: 's7', name: 'Olivia Martinez', classroomId: 'c2' },
-  { id: 's8', name: 'Lucas Bennett', classroomId: 'c2' },
-  { id: 's9', name: 'Isabella Nguyen', classroomId: 'c2' },
-  { id: 's10', name: 'Mason Carter', classroomId: 'c2' },
-  { id: 's11', name: 'Emma Davis', classroomId: 'c2' },
-  { id: 's12', name: 'Jacob Wright', classroomId: 'c3' },
-  { id: 's13', name: 'Charlotte Lee', classroomId: 'c3' },
-  { id: 's14', name: 'Benjamin Torres', classroomId: 'c3' },
-  { id: 's15', name: 'Amelia Foster', classroomId: 'c3' },
-  { id: 's16', name: 'Elijah Ramirez', classroomId: 'c3' },
-  { id: 's17', name: 'Harper Simmons', classroomId: 'c3' }
-];
 
 /* ============================ HELPERS ============================ */
 function pad2(n) { return n < 10 ? '0' + n : '' + n; }
 function toDateStr(d) { return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate()); }
 function todayStr() { return toDateStr(new Date()); }
-function parseDateStr(s) { const [y,m,d] = s.split('-').map(Number); return new Date(y, m - 1, d); }
+function parseDateStr(s) { const parts = s.split('-').map(Number); return new Date(parts[0], parts[1] - 1, parts[2]); }
 function addDays(d, n) { const nd = new Date(d); nd.setDate(nd.getDate() + n); return nd; }
 function formatDisplayDate(dateStr) {
   const d = parseDateStr(dateStr);
@@ -109,74 +130,294 @@ function colorForName(name) {
   return AVATAR_COLORS[Math.abs(hash) % AVATAR_COLORS.length];
 }
 function uid(prefix) { return prefix + '_' + Math.random().toString(36).slice(2,9); }
-
-// Deterministic seeded pseudo-random generator based on a string seed
-function seededRandom(seedStr) {
-  let h = 0;
-  for (let i = 0; i < seedStr.length; i++) { h = Math.imul(31, h) + seedStr.charCodeAt(i) | 0; }
-  h = Math.abs(h);
-  return (h % 10000) / 10000;
+function classroomLabel(cls) { return cls ? (cls.grade + ' \u2014 ' + cls.teacher) : 'Unknown Classroom'; }
+function logId(dateStr, classroomId) { return dateStr + '__' + classroomId; }
+function defaultEntry() { return { absent: false, meal: 'hot', milk: 'none' }; }
+function emptyEntries(roster) {
+  const e = {};
+  roster.forEach(s => { e[s.id] = defaultEntry(); });
+  return e;
 }
-
-function isWeekday(d) { const day = d.getDay(); return day !== 0 && day !== 6; }
-
-/* ============================ MOCK HISTORY GENERATION ============================ */
-function generateHistoricalLogs(classrooms, students) {
-  const logs = {};
-  const today = new Date();
-  const daysBack = 75; // roughly one semester's worth of school data
-  for (let i = daysBack; i >= 1; i--) {
-    const d = addDays(today, -i);
-    if (!isWeekday(d)) continue;
-    const dateStr = toDateStr(d);
-    logs[dateStr] = {};
-    classrooms.forEach(cls => {
-      const roster = students.filter(s => s.classroomId === cls.id);
-      const entries = {};
-      roster.forEach((s, idx) => {
-        const seed = dateStr + '-' + s.id;
-        const r1 = seededRandom(seed + '-portion');
-        const r2 = seededRandom(seed + '-milk');
-        const fullPortion = r1 < 0.87;
-        let milk = 'none';
-        if (r2 < 0.42) milk = 'white';
-        else if (r2 < 0.80) milk = 'chocolate';
-        else milk = 'none';
-        entries[s.id] = { fullPortion, milk };
-      });
-      // Occasionally a classroom log is missing (teacher forgot) to make data realistic
-      const skip = seededRandom(dateStr + '-' + cls.id + '-skip') < 0.04;
-      if (!skip) {
-        logs[dateStr][cls.id] = {
-          submitted: true,
-          submittedAt: new Date(d.getFullYear(), d.getMonth(), d.getDate(), 11, 45).toISOString(),
-          entries
-        };
-      }
-    });
+function tallyEntries(entries, roster) {
+  let hot = 0, sack = 0, absent = 0, white = 0, choc = 0;
+  roster.forEach(s => {
+    const e = (entries && entries[s.id]) || defaultEntry();
+    if (e.absent) { absent++; return; }
+    if (e.meal === 'hot') hot++; else if (e.meal === 'sack') sack++;
+    if (e.milk === 'white') white++; else if (e.milk === 'chocolate') choc++;
+  });
+  return { hot, sack, absent, white, choc, total: roster.length };
+}
+function getWeekRange(dateStr) {
+  const d = parseDateStr(dateStr);
+  const day = d.getDay();
+  const diffToMonday = day === 0 ? -6 : 1 - day;
+  const monday = addDays(d, diffToMonday);
+  const friday = addDays(monday, 4);
+  return { start: monday, end: friday };
+}
+function getMonthRange(monthStr) {
+  const parts = monthStr.split('-').map(Number);
+  const y = parts[0], m = parts[1];
+  return { start: new Date(y, m - 1, 1), end: new Date(y, m, 0) };
+}
+function getWeeksInMonth(monthStr) {
+  const range = getMonthRange(monthStr);
+  const weeks = [];
+  let cursor = new Date(range.start);
+  const day = cursor.getDay();
+  const diffToMonday = day === 0 ? -6 : 1 - day;
+  cursor = addDays(cursor, diffToMonday);
+  while (cursor <= range.end) {
+    const wkStart = new Date(cursor);
+    const wkEnd = addDays(cursor, 4);
+    weeks.push({ start: wkStart, end: wkEnd });
+    cursor = addDays(cursor, 7);
   }
-  return logs;
+  return weeks;
+}
+function getRangeSince(startDateStr, endRefDateStr) {
+  if (!startDateStr) return null;
+  const start = parseDateStr(startDateStr);
+  const end = parseDateStr(endRefDateStr || todayStr());
+  return { start, end: end < start ? start : end };
 }
 
-function loadInitialData() {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (raw) {
-      const parsed = JSON.parse(raw);
-      if (parsed && parsed.classrooms && parsed.students && parsed.logs) return parsed;
-    }
-  } catch (e) { console.warn('Failed to load saved data, resetting.', e); }
-  const data = {
-    classrooms: INITIAL_CLASSROOMS,
-    students: INITIAL_STUDENTS,
-    logs: generateHistoricalLogs(INITIAL_CLASSROOMS, INITIAL_STUDENTS)
+/* ============================ FIRESTORE ACCESS ============================ */
+function useCollection(name) {
+  const [items, setItems] = useState([]);
+  const [loading, setLoading] = useState(true);
+  useEffect(() => {
+    const unsub = db.collection(name).onSnapshot(
+      snap => { setItems(snap.docs.map(d => ({ id: d.id, ...d.data() }))); setLoading(false); },
+      err => { console.error('Firestore read error (' + name + '):', err); setLoading(false); }
+    );
+    return () => unsub();
+    // eslint-disable-next-line
+  }, [name]);
+  return { items, loading };
+}
+
+function useSettingsDoc() {
+  const [settings, setSettings] = useState({ semesterStart: '', quarterStart: '' });
+  const [loading, setLoading] = useState(true);
+  useEffect(() => {
+    const unsub = db.collection('settings').doc('config').onSnapshot(
+      doc => { setSettings(doc.exists ? doc.data() : { semesterStart: '', quarterStart: '' }); setLoading(false); },
+      err => { console.error('Firestore settings read error:', err); setLoading(false); }
+    );
+    return () => unsub();
+  }, []);
+  return { settings, loading };
+}
+
+function useLogs() {
+  const { items, loading } = useCollection('logs');
+  const logsById = useMemo(() => {
+    const map = {};
+    items.forEach(l => { map[l.id] = l; });
+    return map;
+  }, [items]);
+  return { logs: items, logsById, loading };
+}
+
+async function saveClassroom(cls) {
+  const id = cls.id || uid('c');
+  await db.collection('classrooms').doc(id).set({ grade: cls.grade, teacher: cls.teacher });
+  return id;
+}
+async function deleteClassroomDoc(id) { await db.collection('classrooms').doc(id).delete(); }
+
+async function saveStudent(s) {
+  const id = s.id || uid('s');
+  await db.collection('students').doc(id).set({ name: s.name, classroomId: s.classroomId });
+  return id;
+}
+async function deleteStudentDoc(id) { await db.collection('students').doc(id).delete(); }
+
+async function saveSettings(settings) {
+  await db.collection('settings').doc('config').set(settings, { merge: true });
+}
+
+// Logs are always written as a full document (rather than partial merges) since the
+// UI already holds the latest synced copy locally; last write wins, which is fine for
+// this app's scale (a handful of teachers editing their own classroom's counts).
+async function saveLogFull(dateStr, classroomId, obj) {
+  const id = logId(dateStr, classroomId);
+  const payload = {
+    date: dateStr,
+    classroomId,
+    pre: obj.pre || { entries: {}, submitted: false, submittedAt: null },
+    final: obj.final || { entries: {}, submitted: false, submittedAt: null },
+    verified: obj.verified || false,
+    verifiedAt: obj.verifiedAt || null
   };
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
-  return data;
+  await db.collection('logs').doc(id).set(payload);
 }
 
-function saveData(data) {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+/* ============================ EXPORT (GOOGLE SHEETS COMPATIBLE TSV) ============================ */
+function tsvEscape(v) { return String(v == null ? '' : v).replace(/\t/g, ' ').replace(/\r?\n/g, ' '); }
+function rowsToTSV(rows) { return rows.map(r => r.map(tsvEscape).join('\t')).join('\n'); }
+function downloadTSV(filename, rows) {
+  const tsv = rowsToTSV(rows);
+  const blob = new Blob([tsv], { type: 'text/tab-separated-values;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+function buildDailyExportRows(data, dateStr) {
+  const rows = [];
+  rows.push(['Daily Lunch Count Export']);
+  rows.push(['Date', formatDisplayDate(dateStr)]);
+  rows.push([]);
+  rows.push(['Summary: Pre-Count vs Final Count']);
+  rows.push(['Classroom', 'Grade', 'Teacher', 'Stage', 'Hot Lunch', 'Sack Lunch', 'Absent', 'White Milk', 'Chocolate Milk', 'Total Students']);
+
+  const grand = { pre: { hot: 0, sack: 0, absent: 0, white: 0, choc: 0 }, final: { hot: 0, sack: 0, absent: 0, white: 0, choc: 0 }, total: 0 };
+
+  data.classrooms.forEach(cls => {
+    const roster = data.students.filter(s => s.classroomId === cls.id);
+    const log = data.logsById[logId(dateStr, cls.id)];
+    const preT = tallyEntries(log && log.pre && log.pre.entries, roster);
+    const finalT = tallyEntries(log && log.final && log.final.entries, roster);
+    rows.push([classroomLabel(cls), cls.grade, cls.teacher, 'Pre-Count', preT.hot, preT.sack, preT.absent, preT.white, preT.choc, roster.length]);
+    rows.push([classroomLabel(cls), cls.grade, cls.teacher, 'Final Count', finalT.hot, finalT.sack, finalT.absent, finalT.white, finalT.choc, roster.length]);
+    grand.pre.hot += preT.hot; grand.pre.sack += preT.sack; grand.pre.absent += preT.absent; grand.pre.white += preT.white; grand.pre.choc += preT.choc;
+    grand.final.hot += finalT.hot; grand.final.sack += finalT.sack; grand.final.absent += finalT.absent; grand.final.white += finalT.white; grand.final.choc += finalT.choc;
+    grand.total += roster.length;
+  });
+
+  rows.push(['GRAND TOTAL', '', '', 'Pre-Count', grand.pre.hot, grand.pre.sack, grand.pre.absent, grand.pre.white, grand.pre.choc, grand.total]);
+  rows.push(['GRAND TOTAL', '', '', 'Final Count', grand.final.hot, grand.final.sack, grand.final.absent, grand.final.white, grand.final.choc, grand.total]);
+  rows.push([]);
+  rows.push(['Student-Level Final Count Detail']);
+  rows.push(['Classroom', 'Grade', 'Teacher', 'Student', 'Final Status', 'Milk']);
+
+  data.classrooms.forEach(cls => {
+    const roster = data.students.filter(s => s.classroomId === cls.id);
+    const log = data.logsById[logId(dateStr, cls.id)];
+    const entries = (log && log.final && log.final.entries) || {};
+    roster.forEach(s => {
+      const e = entries[s.id] || defaultEntry();
+      const status = e.absent ? 'Absent' : (e.meal === 'hot' ? 'Hot Lunch (Full Portion)' : 'Sack Lunch');
+      const milk = e.absent ? '\u2014' : (e.milk === 'none' ? 'No Milk' : (e.milk === 'white' ? 'White Milk' : 'Chocolate Milk'));
+      rows.push([classroomLabel(cls), cls.grade, cls.teacher, s.name, status, milk]);
+    });
+  });
+
+  return rows;
+}
+
+function buildWeeklyExportRows(data, dateStr) {
+  const wr = getWeekRange(dateStr);
+  const dayStrs = [0,1,2,3,4].map(i => toDateStr(addDays(wr.start, i)));
+
+  const rows = [];
+  rows.push(['Weekly Lunch Count Export']);
+  rows.push(['Week Of', formatShortDate(dayStrs[0]) + ' to ' + formatShortDate(dayStrs[4])]);
+  rows.push([]);
+  rows.push(['Classroom', 'Grade', 'Teacher', 'Student'].concat(dayStrs.map(formatShortDate)));
+
+  const totals = { hot: 0, sack: 0, absent: 0, white: 0, choc: 0 };
+
+  data.classrooms.forEach(cls => {
+    const roster = data.students.filter(s => s.classroomId === cls.id);
+    roster.forEach(s => {
+      const cells = [classroomLabel(cls), cls.grade, cls.teacher, s.name];
+      dayStrs.forEach(d => {
+        const log = data.logsById[logId(d, cls.id)];
+        if (!log || !log.final || !log.final.submitted) { cells.push('\u2014'); return; }
+        const e = log.final.entries[s.id] || defaultEntry();
+        if (e.absent) { cells.push('Absent'); totals.absent++; return; }
+        let cell = e.meal === 'hot' ? 'Hot' : 'Sack';
+        if (e.meal === 'hot') totals.hot++; else totals.sack++;
+        if (e.milk === 'white') { cell += ' / White Milk'; totals.white++; }
+        else if (e.milk === 'chocolate') { cell += ' / Choc. Milk'; totals.choc++; }
+        cells.push(cell);
+      });
+      rows.push(cells);
+    });
+  });
+
+  rows.push([]);
+  rows.push(['Weekly Summary Totals']);
+  rows.push(['Total Hot Lunches', totals.hot]);
+  rows.push(['Total Sack Lunches', totals.sack]);
+  rows.push(['Total White Milk', totals.white]);
+  rows.push(['Total Chocolate Milk', totals.choc]);
+  rows.push(['Total Absences', totals.absent]);
+  return rows;
+}
+
+function buildMonthlyExportRows(data, monthStr) {
+  const weeks = getWeeksInMonth(monthStr);
+  const monthLabel = getMonthRange(monthStr).start.toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
+
+  const rows = [];
+  rows.push(['Monthly Lunch Count Export']);
+  rows.push(['Month', monthLabel]);
+  rows.push([]);
+  rows.push(['Classroom', 'Grade', 'Teacher', 'Student'].concat(weeks.map((w, i) => 'Week ' + (i + 1) + ' (' + formatShortDate(toDateStr(w.start)) + '-' + formatShortDate(toDateStr(w.end)) + ')')));
+
+  const monthTotals = { hot: 0, sack: 0, absent: 0, white: 0, choc: 0 };
+
+  data.classrooms.forEach(cls => {
+    const roster = data.students.filter(s => s.classroomId === cls.id);
+    roster.forEach(s => {
+      const cells = [classroomLabel(cls), cls.grade, cls.teacher, s.name];
+      weeks.forEach(w => {
+        let hot = 0, sack = 0, absent = 0, white = 0, choc = 0;
+        for (let i = 0; i < 5; i++) {
+          const d = toDateStr(addDays(w.start, i));
+          const log = data.logsById[logId(d, cls.id)];
+          if (!log || !log.final || !log.final.submitted) continue;
+          const e = log.final.entries[s.id] || defaultEntry();
+          if (e.absent) { absent++; continue; }
+          if (e.meal === 'hot') hot++; else sack++;
+          if (e.milk === 'white') white++; else if (e.milk === 'chocolate') choc++;
+        }
+        cells.push(hot + ' Hot, ' + sack + ' Sack, ' + absent + ' Absent, ' + white + ' White Milk, ' + choc + ' Choc. Milk');
+        monthTotals.hot += hot; monthTotals.sack += sack; monthTotals.absent += absent; monthTotals.white += white; monthTotals.choc += choc;
+      });
+      rows.push(cells);
+    });
+  });
+
+  rows.push([]);
+  rows.push(['Monthly Summary Totals (All Weeks Aggregated)']);
+  rows.push(['Total Hot Lunches', monthTotals.hot]);
+  rows.push(['Total Sack Lunches', monthTotals.sack]);
+  rows.push(['Total White Milk', monthTotals.white]);
+  rows.push(['Total Chocolate Milk', monthTotals.choc]);
+  rows.push(['Total Absences', monthTotals.absent]);
+  return rows;
+}
+
+function aggregateRange(data, startDate, endDate) {
+  const result = {};
+  data.classrooms.forEach(c => { result[c.id] = { hot: 0, sack: 0, absent: 0, white: 0, choc: 0, daysLogged: 0, daysVerified: 0 }; });
+  data.logs.forEach(log => {
+    const d = parseDateStr(log.date);
+    if (d < startDate || d > endDate) return;
+    if (!result[log.classroomId]) return;
+    if (!log.final || !log.final.submitted) return;
+    const roster = data.students.filter(s => s.classroomId === log.classroomId);
+    const t = tallyEntries(log.final.entries, roster);
+    result[log.classroomId].hot += t.hot;
+    result[log.classroomId].sack += t.sack;
+    result[log.classroomId].absent += t.absent;
+    result[log.classroomId].white += t.white;
+    result[log.classroomId].choc += t.choc;
+    result[log.classroomId].daysLogged++;
+    if (log.verified) result[log.classroomId].daysVerified++;
+  });
+  return result;
 }
 
 /* ============================ SMALL UI PRIMITIVES ============================ */
@@ -184,7 +425,8 @@ function Badge({ status }) {
   const styles = {
     'Completed': 'bg-green-100 text-green-800 border border-green-300',
     'In Progress': 'bg-amber-100 text-amber-800 border border-amber-300',
-    'Not Started': 'bg-gray-100 text-gray-600 border border-gray-300'
+    'Not Started': 'bg-gray-100 text-gray-600 border border-gray-300',
+    'Verified': 'bg-purple-100 text-purple-800 border border-purple-300'
   };
   return (
     <span className={"px-3 py-1 rounded-full text-xs font-semibold " + styles[status]}>{status}</span>
@@ -203,6 +445,29 @@ function Avatar({ name, size }) {
   );
 }
 
+function StatCard({ label, value }) {
+  return (
+    <div className="bg-white rounded-2xl card-shadow p-4 text-center border border-primary-100">
+      <p className="text-3xl font-bold text-primary">{value}</p>
+      <p className="text-xs font-medium text-primary-500 uppercase mt-1">{label}</p>
+    </div>
+  );
+}
+
+function BarRow({ label, value, max, color }) {
+  const pct = max > 0 ? Math.round((value / max) * 100) : 0;
+  return (
+    <div className="mb-3">
+      <div className="flex justify-between text-sm font-medium text-primary-700 mb-1">
+        <span>{label}</span><span className="font-bold">{value}</span>
+      </div>
+      <div className="w-full bg-primary-50 rounded-full h-3 overflow-hidden">
+        <div className="h-3 rounded-full transition-fast" style={{ width: pct + '%', backgroundColor: color }}></div>
+      </div>
+    </div>
+  );
+}
+
 function PrimaryButton({ children, onClick, className, disabled, type }) {
   return (
     <button
@@ -216,9 +481,10 @@ function PrimaryButton({ children, onClick, className, disabled, type }) {
   );
 }
 
-function GhostButton({ children, onClick, className }) {
+function GhostButton({ children, onClick, className, type }) {
   return (
     <button
+      type={type || 'button'}
       onClick={onClick}
       className={"btn-touch px-5 py-3 rounded-xl bg-white text-primary font-semibold text-base border-2 border-primary-200 transition-fast hover:bg-primary-50 active:scale-[0.98] " + (className || '')}
     >
@@ -227,23 +493,42 @@ function GhostButton({ children, onClick, className }) {
   );
 }
 
-/* ============================ LOGIN MODAL ============================ */
+/* ============================ LOGIN MODAL (FIREBASE AUTH) ============================ */
 function AdminLoginModal({ onClose, onSuccess }) {
+  const [email, setEmail] = useState('');
   const [pw, setPw] = useState('');
   const [error, setError] = useState('');
-  function submit(e) {
+  const [busy, setBusy] = useState(false);
+
+  async function submit(e) {
     e.preventDefault();
-    if (pw === ADMIN_PASSWORD) { onSuccess(); }
-    else { setError('Incorrect password. Try again.'); }
+    setError('');
+    setBusy(true);
+    try {
+      await auth.signInWithEmailAndPassword(email.trim(), pw);
+      onSuccess();
+    } catch (err) {
+      setError((err && err.message) ? err.message : 'Sign-in failed. Check your email and password.');
+    } finally {
+      setBusy(false);
+    }
   }
+
   return (
     <div className="fixed inset-0 bg-primary-900/40 flex items-center justify-center z-50 p-4">
       <div className="bg-white rounded-2xl card-shadow-lg p-6 w-full max-w-sm">
         <h2 className="text-xl font-bold text-primary-900 mb-1">Admin Access</h2>
-        <p className="text-sm font-light text-primary-700 mb-4">Enter the administrator password to continue.</p>
+        <p className="text-sm font-light text-primary-700 mb-4">Sign in with your administrator account to continue.</p>
         <form onSubmit={submit}>
           <input
             autoFocus
+            type="email"
+            value={email}
+            onChange={e => { setEmail(e.target.value); setError(''); }}
+            placeholder="Email"
+            className="w-full border-2 border-primary-200 rounded-xl px-4 py-3 mb-2 focus:outline-none focus:border-primary"
+          />
+          <input
             type="password"
             value={pw}
             onChange={e => { setPw(e.target.value); setError(''); }}
@@ -251,10 +536,9 @@ function AdminLoginModal({ onClose, onSuccess }) {
             className="w-full border-2 border-primary-200 rounded-xl px-4 py-3 mb-2 focus:outline-none focus:border-primary"
           />
           {error && <p className="text-sm text-rose-600 mb-2">{error}</p>}
-          <p className="text-xs font-light text-primary-400 mb-4 italic">Prototype hint: admin123</p>
-          <div className="flex gap-2">
+          <div className="flex gap-2 mt-2">
             <GhostButton onClick={onClose} className="flex-1">Cancel</GhostButton>
-            <PrimaryButton type="submit" className="flex-1">Log In</PrimaryButton>
+            <PrimaryButton type="submit" disabled={busy} className="flex-1">{busy ? 'Signing In\u2026' : 'Log In'}</PrimaryButton>
           </div>
         </form>
       </div>
@@ -268,7 +552,7 @@ function NavBar({ role, onRequestRole, currentDate }) {
     <div className="bg-primary text-white sticky top-0 z-40 card-shadow">
       <div className="max-w-6xl mx-auto px-4 sm:px-6 py-4 flex items-center justify-between flex-wrap gap-3">
         <div>
-          <h1 className="text-2xl font-bold leading-tight">🍽️ Lunch Tracker</h1>
+          <h1 className="text-2xl font-bold leading-tight">\uD83C\uDF7D\uFE0F Lunch Tracker</h1>
           <p className="text-xs font-light text-primary-100 italic">{formatDisplayDate(currentDate)}</p>
         </div>
         <div className="flex bg-primary-700 rounded-xl p-1 gap-1">
@@ -291,24 +575,31 @@ function NavBar({ role, onRequestRole, currentDate }) {
 }
 
 /* ============================ TEACHER: OVERVIEW ============================ */
-function computeStatus(logs, dateStr, classroomId) {
-  const log = logs[dateStr] && logs[dateStr][classroomId];
-  if (!log) return 'Not Started';
-  return log.submitted ? 'Completed' : 'In Progress';
-}
-
 function TeacherOverview({ data, onOpenClassroom }) {
   const today = todayStr();
+
+  if (data.classrooms.length === 0) {
+    return (
+      <div className="max-w-2xl mx-auto px-6 py-16 text-center">
+        <h2 className="text-2xl font-bold text-primary-900 mb-2">No classrooms yet</h2>
+        <p className="text-primary-600 font-light">Ask your administrator to add classrooms under Admin View &rarr; Classrooms.</p>
+      </div>
+    );
+  }
+
   return (
     <div className="max-w-6xl mx-auto px-4 sm:px-6 py-8">
       <div className="mb-6">
         <h2 className="text-2xl font-bold text-primary-900">Today's Classrooms</h2>
-        <p className="text-primary-600 font-light">Select a classroom to log lunch counts and milk selections.</p>
+        <p className="text-primary-600 font-light">Select a classroom to take the morning pre-count or lunchtime final count.</p>
       </div>
       <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-5">
         {data.classrooms.map(cls => {
           const roster = data.students.filter(s => s.classroomId === cls.id);
-          const status = computeStatus(data.logs, today, cls.id);
+          const log = data.logsById[logId(today, cls.id)];
+          const preStatus = (log && log.pre && log.pre.submitted) ? 'Completed' : (log && log.pre ? 'In Progress' : 'Not Started');
+          const finalStatus = (log && log.final && log.final.submitted) ? 'Completed' : (log && log.final ? 'In Progress' : 'Not Started');
+          const verified = !!(log && log.verified);
           return (
             <button
               key={cls.id}
@@ -317,10 +608,18 @@ function TeacherOverview({ data, onOpenClassroom }) {
             >
               <div className="flex justify-between items-start mb-3">
                 <div>
-                  <h3 className="text-xl font-bold text-primary-900">{cls.name}</h3>
-                  <p className="text-sm font-medium text-primary-500">{cls.grade} &middot; {cls.teacher}</p>
+                  <h3 className="text-xl font-bold text-primary-900">{cls.grade}</h3>
+                  <p className="text-sm font-medium text-primary-500">{cls.teacher}</p>
                 </div>
-                <Badge status={status} />
+                {verified && <Badge status="Verified" />}
+              </div>
+              <div className="flex items-center gap-2 mb-1">
+                <span className="text-xs font-medium text-primary-400 uppercase w-24">Pre-Count</span>
+                <Badge status={preStatus} />
+              </div>
+              <div className="flex items-center gap-2 mb-3">
+                <span className="text-xs font-medium text-primary-400 uppercase w-24">Final Count</span>
+                <Badge status={finalStatus} />
               </div>
               <p className="text-sm font-light text-primary-600">{roster.length} students</p>
             </button>
@@ -331,47 +630,59 @@ function TeacherOverview({ data, onOpenClassroom }) {
   );
 }
 
-/* ============================ TEACHER: ROSTER ============================ */
-function ensureTodayLog(data, classroomId, dateStr) {
-  const roster = data.students.filter(s => s.classroomId === classroomId);
-  const existing = data.logs[dateStr] && data.logs[dateStr][classroomId];
-  if (existing) return existing;
-  const entries = {};
-  roster.forEach(s => { entries[s.id] = { fullPortion: true, milk: 'none' }; });
-  return { submitted: false, submittedAt: null, entries };
-}
+/* ============================ STUDENT ENTRY CARD ============================ */
+function StudentEntryCard({ student, entry, onChange, disabled }) {
+  const e = entry || defaultEntry();
+  function set(patch) { if (!disabled) onChange({ ...e, ...patch }); }
 
-function StudentRosterCard({ student, entry, onChange }) {
   return (
-    <div className="bg-white rounded-2xl card-shadow p-4 border border-primary-100 flex flex-col gap-3">
-      <div className="flex items-center gap-3">
-        <Avatar name={student.name} size={52} />
-        <div className="min-w-0">
-          <p className="font-semibold text-primary-900 truncate">{student.name}</p>
-        </div>
+    <div className={"relative rounded-2xl card-shadow p-4 border flex flex-col gap-3 transition-fast " + (e.absent ? 'bg-gray-100 border-gray-300' : 'bg-white border-primary-100')}>
+      <button
+        type="button"
+        disabled={disabled}
+        onClick={() => set({ absent: !e.absent })}
+        className={"absolute top-3 right-3 text-xs font-bold px-2.5 py-1.5 rounded-full transition-fast " + (e.absent ? 'bg-rose-600 text-white' : 'bg-rose-50 text-rose-600 hover:bg-rose-100')}
+      >
+        {e.absent ? 'Absent' : 'Mark Absent'}
+      </button>
+
+      <div className={"flex items-center gap-3 pr-24 " + (e.absent ? 'opacity-60' : '')}>
+        <Avatar name={student.name} size={48} />
+        <p className="font-semibold text-primary-900 truncate">{student.name}</p>
       </div>
-      <div>
-        <p className="text-xs font-medium text-primary-500 mb-1 uppercase tracking-wide">Full Portion Received</p>
-        <div className="flex gap-2">
+
+      <div className={e.absent ? 'opacity-40 pointer-events-none select-none' : ''}>
+        <p className="text-xs font-medium text-primary-500 mb-1 uppercase tracking-wide">Meal</p>
+        <div className="flex gap-2 mb-3">
           <button
-            onClick={() => onChange({ ...entry, fullPortion: true })}
-            className={"flex-1 btn-touch rounded-xl font-semibold text-sm transition-fast border-2 " + (entry.fullPortion ? 'bg-primary text-white border-primary' : 'bg-white text-primary-700 border-primary-200 hover:bg-primary-50')}
-          >Yes</button>
+            type="button"
+            disabled={disabled}
+            onClick={() => set({ meal: 'hot' })}
+            className={"flex-1 btn-touch rounded-xl font-semibold text-sm transition-fast border-2 " + (e.meal === 'hot' ? 'bg-primary text-white border-primary' : 'bg-gray-50 text-gray-400 border-gray-200 hover:bg-gray-100')}
+          >
+            Hot Lunch
+          </button>
           <button
-            onClick={() => onChange({ ...entry, fullPortion: false })}
-            className={"flex-1 btn-touch rounded-xl font-semibold text-sm transition-fast border-2 " + (!entry.fullPortion ? 'bg-rose-600 text-white border-rose-600' : 'bg-white text-primary-700 border-primary-200 hover:bg-primary-50')}
-          >No</button>
+            type="button"
+            disabled={disabled}
+            onClick={() => set({ meal: 'sack' })}
+            className={"flex-1 btn-touch rounded-xl font-semibold text-sm transition-fast border-2 " + (e.meal === 'sack' ? 'bg-primary text-white border-primary' : 'bg-gray-50 text-gray-400 border-gray-200 hover:bg-gray-100')}
+          >
+            Sack Lunch
+          </button>
         </div>
-      </div>
-      <div>
         <p className="text-xs font-medium text-primary-500 mb-1 uppercase tracking-wide">Milk Picked Up</p>
         <div className="flex gap-2">
           {[['none','None'],['white','White'],['chocolate','Choc.']].map(([val,label]) => (
             <button
+              type="button"
               key={val}
-              onClick={() => onChange({ ...entry, milk: val })}
-              className={"flex-1 btn-touch rounded-xl font-semibold text-xs transition-fast border-2 " + (entry.milk === val ? 'bg-primary text-white border-primary' : 'bg-white text-primary-700 border-primary-200 hover:bg-primary-50')}
-            >{label}</button>
+              disabled={disabled}
+              onClick={() => set({ milk: val })}
+              className={"flex-1 btn-touch rounded-xl font-semibold text-xs transition-fast border-2 " + (e.milk === val ? 'bg-primary text-white border-primary' : 'bg-white text-primary-700 border-primary-200 hover:bg-primary-50')}
+            >
+              {label}
+            </button>
           ))}
         </div>
       </div>
@@ -379,368 +690,344 @@ function StudentRosterCard({ student, entry, onChange }) {
   );
 }
 
-function ClassroomRoster({ data, classroomId, onBack, onReview, persist }) {
-  const today = todayStr();
+/* ============================ TEACHER: CLASSROOM WORKSPACE ============================ */
+function ClassroomWorkspace({ data, classroomId, onBack }) {
   const cls = data.classrooms.find(c => c.id === classroomId);
   const roster = data.students.filter(s => s.classroomId === classroomId);
-  const log = ensureTodayLog(data, classroomId, today);
+  const today = todayStr();
+  const todayLog = data.logsById[logId(today, classroomId)];
+  const verified = !!(todayLog && todayLog.verified);
 
-  // persist a draft immediately so state survives reloads
+  const [stage, setStage] = useState('pre');
+  const [reviewing, setReviewing] = useState(false);
+
   useEffect(() => {
-    if (!(data.logs[today] && data.logs[today][classroomId])) {
-      const newLogs = { ...data.logs, [today]: { ...(data.logs[today] || {}), [classroomId]: log } };
-      persist({ ...data, logs: newLogs });
+    if (!todayLog) {
+      saveLogFull(today, classroomId, {
+        pre: { entries: emptyEntries(roster), submitted: false, submittedAt: null },
+        final: { entries: emptyEntries(roster), submitted: false, submittedAt: null },
+        verified: false,
+        verifiedAt: null
+      });
     }
     // eslint-disable-next-line
   }, []);
 
-  function updateEntry(studentId, newEntry) {
-    const currentLog = (data.logs[today] && data.logs[today][classroomId]) || log;
-    const newLog = { ...currentLog, entries: { ...currentLog.entries, [studentId]: newEntry } };
-    const newLogs = { ...data.logs, [today]: { ...(data.logs[today] || {}), [classroomId]: newLog } };
-    persist({ ...data, logs: newLogs });
+  if (!cls) return null;
+
+  const preEntries = (todayLog && todayLog.pre && todayLog.pre.entries) || emptyEntries(roster);
+  const hasOwnFinalEntries = todayLog && todayLog.final && todayLog.final.entries && Object.keys(todayLog.final.entries).length > 0;
+  const finalEntries = hasOwnFinalEntries ? todayLog.final.entries : preEntries;
+
+  const preSubmitted = !!(todayLog && todayLog.pre && todayLog.pre.submitted);
+  const finalSubmitted = !!(todayLog && todayLog.final && todayLog.final.submitted);
+
+  async function updateEntry(targetStage, studentId, entry) {
+    if (verified) return;
+    const base = todayLog || {
+      pre: { entries: emptyEntries(roster), submitted: false, submittedAt: null },
+      final: { entries: emptyEntries(roster), submitted: false, submittedAt: null },
+      verified: false,
+      verifiedAt: null
+    };
+    if (targetStage === 'pre') {
+      const newPre = { ...base.pre, entries: { ...base.pre.entries, [studentId]: entry } };
+      await saveLogFull(today, classroomId, { ...base, pre: newPre });
+    } else {
+      const currentFinalEntries = (base.final && Object.keys(base.final.entries || {}).length) ? base.final.entries : preEntries;
+      const newFinal = { ...(base.final || {}), entries: { ...currentFinalEntries, [studentId]: entry } };
+      await saveLogFull(today, classroomId, { ...base, final: newFinal });
+    }
   }
 
-  const currentEntries = (data.logs[today] && data.logs[today][classroomId] && data.logs[today][classroomId].entries) || log.entries;
-  const isSubmitted = data.logs[today] && data.logs[today][classroomId] && data.logs[today][classroomId].submitted;
+  async function submitPre() {
+    const base = todayLog || { final: { entries: emptyEntries(roster), submitted: false, submittedAt: null }, verified: false, verifiedAt: null };
+    await saveLogFull(today, classroomId, { ...base, pre: { entries: preEntries, submitted: true, submittedAt: new Date().toISOString() } });
+  }
+
+  async function submitFinal() {
+    const base = todayLog || { pre: { entries: emptyEntries(roster), submitted: false, submittedAt: null }, verified: false, verifiedAt: null };
+    await saveLogFull(today, classroomId, { ...base, final: { entries: finalEntries, submitted: true, submittedAt: new Date().toISOString() } });
+    setReviewing(false);
+  }
+
+  const activeEntries = stage === 'pre' ? preEntries : finalEntries;
+  const totals = tallyEntries(activeEntries, roster);
 
   return (
     <div className="max-w-6xl mx-auto px-4 sm:px-6 py-8">
       <div className="flex items-center justify-between mb-6 flex-wrap gap-3">
         <div>
           <button onClick={onBack} className="text-primary font-semibold text-sm mb-2 hover:underline">&larr; Back to Overview</button>
-          <h2 className="text-2xl font-bold text-primary-900">{cls.name} <span className="font-light text-primary-500 text-lg">&middot; {cls.grade}</span></h2>
-          <p className="text-primary-600 font-light">{cls.teacher}</p>
+          <h2 className="text-2xl font-bold text-primary-900">{cls.grade}</h2>
+          <p className="text-primary-600 font-light">{cls.teacher} &middot; {formatDisplayDate(today)}</p>
         </div>
-        {isSubmitted && <Badge status="Completed" />}
+        {verified && <Badge status="Verified" />}
       </div>
 
-      {isSubmitted && (
-        <div className="mb-6 bg-amber-50 border border-amber-300 text-amber-800 rounded-xl p-4 text-sm font-medium">
-          This classroom was already submitted for today. You can still make corrections below and re-submit.
+      {verified && (
+        <div className="mb-6 bg-purple-50 border border-purple-300 text-purple-800 rounded-xl p-4 text-sm font-medium">
+          An administrator has verified and finalized today's counts for this classroom. Counts can no longer be edited.
         </div>
       )}
 
-      <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4 mb-8">
-        {roster.map(s => (
-          <StudentRosterCard
-            key={s.id}
-            student={s}
-            entry={currentEntries[s.id] || { fullPortion: true, milk: 'none' }}
-            onChange={(e) => updateEntry(s.id, e)}
-          />
-        ))}
-      </div>
-
-      <div className="sticky bottom-0 bg-secondary/95 backdrop-blur pt-4 pb-2 border-t border-primary-100">
-        <div className="flex justify-end gap-3">
-          <GhostButton onClick={onBack}>Cancel</GhostButton>
-          <PrimaryButton onClick={() => onReview(classroomId)}>Review Submission &rarr;</PrimaryButton>
+      {roster.length === 0 ? (
+        <div className="bg-white rounded-2xl card-shadow p-8 text-center border border-primary-100">
+          <p className="text-primary-600 font-light">No students assigned to this classroom yet. Ask your admin to add students under Admin View &rarr; Students.</p>
         </div>
-      </div>
+      ) : reviewing ? (
+        <FinalReview
+          cls={cls}
+          roster={roster}
+          entries={finalEntries}
+          preTotals={tallyEntries(preEntries, roster)}
+          onEdit={() => setReviewing(false)}
+          onSubmit={submitFinal}
+        />
+      ) : (
+        <React.Fragment>
+          <div className="flex gap-2 mb-6">
+            <button
+              onClick={() => setStage('pre')}
+              className={"btn-touch px-5 py-2.5 rounded-xl font-semibold text-sm transition-fast border-2 " + (stage === 'pre' ? 'bg-primary text-white border-primary' : 'bg-white text-primary-700 border-primary-200 hover:bg-primary-50')}
+            >
+              Morning Pre-Count {preSubmitted ? '\u2713' : ''}
+            </button>
+            <button
+              onClick={() => setStage('final')}
+              className={"btn-touch px-5 py-2.5 rounded-xl font-semibold text-sm transition-fast border-2 " + (stage === 'final' ? 'bg-primary text-white border-primary' : 'bg-white text-primary-700 border-primary-200 hover:bg-primary-50')}
+            >
+              Lunchtime Final Count {finalSubmitted ? '\u2713' : ''}
+            </button>
+          </div>
+
+          {stage === 'pre' && preSubmitted && !verified && (
+            <div className="mb-6 bg-amber-50 border border-amber-300 text-amber-800 rounded-xl p-4 text-sm font-medium">
+              The pre-count was already submitted for today. You can still make corrections and re-submit.
+            </div>
+          )}
+          {stage === 'final' && finalSubmitted && !verified && (
+            <div className="mb-6 bg-amber-50 border border-amber-300 text-amber-800 rounded-xl p-4 text-sm font-medium">
+              The final count was already submitted. You can still switch any student's status and re-submit before it's verified by an admin.
+            </div>
+          )}
+          {stage === 'final' && !hasOwnFinalEntries && (
+            <div className="mb-6 bg-primary-50 border border-primary-200 text-primary-700 rounded-xl p-4 text-sm font-medium">
+              Starting from this morning's pre-count. Switch any student's meal, milk, or absence status below before submitting.
+            </div>
+          )}
+
+          <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4 mb-8">
+            {roster.map(s => (
+              <StudentEntryCard
+                key={s.id}
+                student={s}
+                entry={activeEntries[s.id] || defaultEntry()}
+                onChange={(entry) => updateEntry(stage, s.id, entry)}
+                disabled={verified}
+              />
+            ))}
+          </div>
+
+          <div className="sticky bottom-0 bg-secondary/95 backdrop-blur pt-4 pb-2 border-t border-primary-100">
+            <div className="flex justify-between items-center flex-wrap gap-3">
+              <p className="text-sm text-primary-600 font-light">
+                Hot {totals.hot} &middot; Sack {totals.sack} &middot; Absent {totals.absent} &middot; White Milk {totals.white} &middot; Choc. Milk {totals.choc}
+              </p>
+              <div className="flex gap-3">
+                <GhostButton onClick={onBack}>Cancel</GhostButton>
+                {stage === 'pre' ? (
+                  <PrimaryButton disabled={verified} onClick={submitPre}>Submit Pre-Count</PrimaryButton>
+                ) : (
+                  <PrimaryButton disabled={verified} onClick={() => setReviewing(true)}>Review Final Count &rarr;</PrimaryButton>
+                )}
+              </div>
+            </div>
+          </div>
+        </React.Fragment>
+      )}
     </div>
   );
 }
 
-/* ============================ TEACHER: REVIEW ============================ */
-function ReviewScreen({ data, classroomId, onEdit, onSubmit }) {
-  const today = todayStr();
-  const cls = data.classrooms.find(c => c.id === classroomId);
-  const roster = data.students.filter(s => s.classroomId === classroomId);
-  const log = data.logs[today][classroomId];
-  const entries = log.entries;
-
-  const totals = useMemo(() => {
-    let full = 0, white = 0, choc = 0;
-    roster.forEach(s => {
-      const e = entries[s.id];
-      if (e.fullPortion) full++;
-      if (e.milk === 'white') white++;
-      if (e.milk === 'chocolate') choc++;
-    });
-    return { full, white, choc };
-  }, [entries, roster]);
-
-  function handleSubmit() {
-    const newLog = { ...log, submitted: true, submittedAt: new Date().toISOString() };
-    const newLogs = { ...data.logs, [today]: { ...data.logs[today], [classroomId]: newLog } };
-    onSubmit({ ...data, logs: newLogs });
-  }
+/* ============================ TEACHER: FINAL COUNT REVIEW ============================ */
+function FinalReview({ cls, roster, entries, preTotals, onEdit, onSubmit }) {
+  const totals = tallyEntries(entries, roster);
 
   return (
-    <div className="max-w-4xl mx-auto px-4 sm:px-6 py-8">
-      <button onClick={() => onEdit(classroomId)} className="text-primary font-semibold text-sm mb-4 hover:underline">&larr; Edit / Go Back</button>
-      <h2 className="text-2xl font-bold text-primary-900 mb-1">Review Submission</h2>
-      <p className="text-primary-600 font-light mb-6">{cls.name} &middot; {cls.grade} &middot; {formatDisplayDate(today)}</p>
+    <div>
+      <button onClick={onEdit} className="text-primary font-semibold text-sm mb-4 hover:underline">&larr; Edit / Go Back</button>
+      <h2 className="text-2xl font-bold text-primary-900 mb-1">Review Final Count</h2>
+      <p className="text-primary-600 font-light mb-6">{cls.grade} &middot; {cls.teacher} &middot; {formatDisplayDate(todayStr())}</p>
 
-      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-8">
-        <div className="bg-white rounded-2xl card-shadow p-4 text-center border border-primary-100">
-          <p className="text-3xl font-bold text-primary">{roster.length}</p>
-          <p className="text-xs font-medium text-primary-500 uppercase mt-1">Students</p>
-        </div>
-        <div className="bg-white rounded-2xl card-shadow p-4 text-center border border-primary-100">
-          <p className="text-3xl font-bold text-primary">{totals.full}</p>
-          <p className="text-xs font-medium text-primary-500 uppercase mt-1">Full Portions</p>
-        </div>
-        <div className="bg-white rounded-2xl card-shadow p-4 text-center border border-primary-100">
-          <p className="text-3xl font-bold text-primary">{totals.white}</p>
-          <p className="text-xs font-medium text-primary-500 uppercase mt-1">White Milk</p>
-        </div>
-        <div className="bg-white rounded-2xl card-shadow p-4 text-center border border-primary-100">
-          <p className="text-3xl font-bold text-primary">{totals.choc}</p>
-          <p className="text-xs font-medium text-primary-500 uppercase mt-1">Chocolate Milk</p>
-        </div>
+      <div className="grid grid-cols-2 sm:grid-cols-5 gap-3 mb-3">
+        <StatCard label="Hot Lunch" value={totals.hot} />
+        <StatCard label="Sack Lunch" value={totals.sack} />
+        <StatCard label="Absent" value={totals.absent} />
+        <StatCard label="White Milk" value={totals.white} />
+        <StatCard label="Choc. Milk" value={totals.choc} />
       </div>
+      <p className="text-xs font-light italic text-primary-500 mb-6">
+        Pre-count comparison: Hot {preTotals.hot} &middot; Sack {preTotals.sack} &middot; Absent {preTotals.absent}
+      </p>
 
       <div className="bg-white rounded-2xl card-shadow border border-primary-100 divide-y divide-primary-50 mb-8 overflow-hidden">
         {roster.map(s => {
-          const e = entries[s.id];
+          const e = entries[s.id] || defaultEntry();
           return (
             <div key={s.id} className="flex items-center gap-3 p-4">
               <Avatar name={s.name} size={40} />
               <p className="font-medium text-primary-900 flex-1 truncate">{s.name}</p>
-              <span className={"text-xs font-semibold px-2 py-1 rounded-full " + (e.fullPortion ? 'bg-green-100 text-green-700' : 'bg-rose-100 text-rose-700')}>
-                {e.fullPortion ? 'Full Portion' : 'Not Full'}
-              </span>
-              <span className="text-xs font-semibold px-2 py-1 rounded-full bg-primary-50 text-primary-700 capitalize">
-                {e.milk === 'none' ? 'No Milk' : e.milk + ' Milk'}
-              </span>
+              {e.absent ? (
+                <span className="text-xs font-semibold px-2 py-1 rounded-full bg-gray-200 text-gray-700">Absent</span>
+              ) : (
+                <React.Fragment>
+                  <span className={"text-xs font-semibold px-2 py-1 rounded-full " + (e.meal === 'hot' ? 'bg-green-100 text-green-700' : 'bg-amber-100 text-amber-700')}>
+                    {e.meal === 'hot' ? 'Hot Lunch' : 'Sack Lunch'}
+                  </span>
+                  <span className="text-xs font-semibold px-2 py-1 rounded-full bg-primary-50 text-primary-700 capitalize">
+                    {e.milk === 'none' ? 'No Milk' : e.milk + ' Milk'}
+                  </span>
+                </React.Fragment>
+              )}
             </div>
           );
         })}
       </div>
 
       <div className="flex justify-end gap-3">
-        <GhostButton onClick={() => onEdit(classroomId)}>Edit / Go Back</GhostButton>
-        <PrimaryButton onClick={handleSubmit}>Save &amp; Submit</PrimaryButton>
+        <GhostButton onClick={onEdit}>Edit / Go Back</GhostButton>
+        <PrimaryButton onClick={onSubmit}>Save &amp; Submit Final Count</PrimaryButton>
       </div>
     </div>
   );
 }
 
-/* ============================ ADMIN: STUDENT MANAGEMENT ============================ */
-function StudentManagement({ data, persist }) {
-  const [newName, setNewName] = useState('');
-  const [newClass, setNewClass] = useState(data.classrooms[0] ? data.classrooms[0].id : '');
-  const [editingId, setEditingId] = useState(null);
-  const [editName, setEditName] = useState('');
+/* ============================ ADMIN: VERIFICATION ============================ */
+function VerificationPanel({ data }) {
+  const [dateVal, setDateVal] = useState(todayStr());
 
-  function addStudent(e) {
-    e.preventDefault();
-    if (!newName.trim() || !newClass) return;
-    const student = { id: uid('s'), name: newName.trim(), classroomId: newClass };
-    persist({ ...data, students: [...data.students, student] });
-    setNewName('');
+  async function verifyClassroom(cls) {
+    const log = data.logsById[logId(dateVal, cls.id)];
+    if (!log || !log.final || !log.final.submitted) { alert('The final count has not been submitted yet for this classroom.'); return; }
+    await saveLogFull(dateVal, cls.id, { ...log, verified: true, verifiedAt: new Date().toISOString() });
   }
-
-  function deleteStudent(id) {
-    if (!confirm('Remove this student? This cannot be undone.')) return;
-    persist({ ...data, students: data.students.filter(s => s.id !== id) });
+  async function unverifyClassroom(cls) {
+    const log = data.logsById[logId(dateVal, cls.id)];
+    if (!log) return;
+    await saveLogFull(dateVal, cls.id, { ...log, verified: false, verifiedAt: null });
   }
-
-  function moveStudent(id, classroomId) {
-    persist({ ...data, students: data.students.map(s => s.id === id ? { ...s, classroomId } : s) });
-  }
-
-  function startEdit(s) { setEditingId(s.id); setEditName(s.name); }
-  function saveEdit(id) {
-    persist({ ...data, students: data.students.map(s => s.id === id ? { ...s, name: editName.trim() || s.name } : s) });
-    setEditingId(null);
-  }
-
-  return (
-    <div>
-      <h3 className="text-xl font-bold text-primary-900 mb-4">Student Management</h3>
-      <form onSubmit={addStudent} className="bg-white rounded-2xl card-shadow p-4 border border-primary-100 mb-6 flex flex-wrap gap-3 items-end">
-        <div className="flex-1 min-w-[180px]">
-          <label className="text-xs font-medium text-primary-500 uppercase">New Student Name</label>
-          <input value={newName} onChange={e => setNewName(e.target.value)} placeholder="e.g. Grace Miller" className="w-full border-2 border-primary-200 rounded-xl px-3 py-2 mt-1 focus:outline-none focus:border-primary" />
-        </div>
-        <div>
-          <label className="text-xs font-medium text-primary-500 uppercase">Classroom</label>
-          <select value={newClass} onChange={e => setNewClass(e.target.value)} className="w-full border-2 border-primary-200 rounded-xl px-3 py-2 mt-1 focus:outline-none focus:border-primary">
-            {data.classrooms.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
-          </select>
-        </div>
-        <PrimaryButton type="submit">Add Student</PrimaryButton>
-      </form>
-
-      <div className="bg-white rounded-2xl card-shadow border border-primary-100 divide-y divide-primary-50 overflow-hidden">
-        {data.students.map(s => {
-          const cls = data.classrooms.find(c => c.id === s.classroomId);
-          return (
-            <div key={s.id} className="flex items-center gap-3 p-4 flex-wrap">
-              <Avatar name={s.name} size={40} />
-              {editingId === s.id ? (
-                <input value={editName} onChange={e => setEditName(e.target.value)} className="border-2 border-primary-200 rounded-lg px-2 py-1 flex-1 min-w-[140px]" autoFocus />
-              ) : (
-                <p className="font-medium text-primary-900 flex-1 min-w-[140px]">{s.name}</p>
-              )}
-              <select
-                value={s.classroomId}
-                onChange={e => moveStudent(s.id, e.target.value)}
-                className="border-2 border-primary-200 rounded-lg px-2 py-1 text-sm"
-              >
-                {data.classrooms.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
-              </select>
-              {editingId === s.id ? (
-                <button onClick={() => saveEdit(s.id)} className="px-3 py-1.5 rounded-lg bg-primary text-white text-sm font-semibold">Save</button>
-              ) : (
-                <button onClick={() => startEdit(s)} className="px-3 py-1.5 rounded-lg bg-primary-50 text-primary text-sm font-semibold hover:bg-primary-100">Edit</button>
-              )}
-              <button onClick={() => deleteStudent(s.id)} className="px-3 py-1.5 rounded-lg bg-rose-50 text-rose-600 text-sm font-semibold hover:bg-rose-100">Delete</button>
-            </div>
-          );
-        })}
-      </div>
-    </div>
-  );
-}
-
-/* ============================ ADMIN: CLASSROOM MANAGEMENT ============================ */
-function ClassroomManagement({ data, persist }) {
-  const [form, setForm] = useState({ name: '', grade: '', teacher: '' });
-  const [editingId, setEditingId] = useState(null);
-  const [editForm, setEditForm] = useState({ name: '', grade: '', teacher: '' });
-
-  function addClassroom(e) {
-    e.preventDefault();
-    if (!form.name.trim()) return;
-    const cls = { id: uid('c'), name: form.name.trim(), grade: form.grade.trim() || 'Unassigned', teacher: form.teacher.trim() || 'TBD' };
-    persist({ ...data, classrooms: [...data.classrooms, cls] });
-    setForm({ name: '', grade: '', teacher: '' });
-  }
-
-  function deleteClassroom(id) {
-    const hasStudents = data.students.some(s => s.classroomId === id);
-    if (hasStudents) {
-      alert('Cannot delete a classroom that still has students assigned. Move students first.');
-      return;
+  async function verifyAll() {
+    const eligible = data.classrooms.filter(cls => {
+      const log = data.logsById[logId(dateVal, cls.id)];
+      return log && log.final && log.final.submitted && !log.verified;
+    });
+    if (eligible.length === 0) { alert('No submitted, unverified classrooms to finalize for this date.'); return; }
+    if (!confirm('Verify and finalize ' + eligible.length + ' classroom(s) for ' + formatDisplayDate(dateVal) + '?')) return;
+    for (const cls of eligible) {
+      const log = data.logsById[logId(dateVal, cls.id)];
+      await saveLogFull(dateVal, cls.id, { ...log, verified: true, verifiedAt: new Date().toISOString() });
     }
-    if (!confirm('Delete this classroom?')) return;
-    persist({ ...data, classrooms: data.classrooms.filter(c => c.id !== id) });
-  }
-
-  function startEdit(c) { setEditingId(c.id); setEditForm({ name: c.name, grade: c.grade, teacher: c.teacher }); }
-  function saveEdit(id) {
-    persist({ ...data, classrooms: data.classrooms.map(c => c.id === id ? { ...c, ...editForm } : c) });
-    setEditingId(null);
   }
 
   return (
     <div>
-      <h3 className="text-xl font-bold text-primary-900 mb-4">Classroom Management</h3>
-      <form onSubmit={addClassroom} className="bg-white rounded-2xl card-shadow p-4 border border-primary-100 mb-6 flex flex-wrap gap-3 items-end">
-        <div>
-          <label className="text-xs font-medium text-primary-500 uppercase">Room / Name</label>
-          <input value={form.name} onChange={e => setForm({...form, name: e.target.value})} placeholder="Room 112" className="border-2 border-primary-200 rounded-xl px-3 py-2 mt-1 w-40 focus:outline-none focus:border-primary" />
-        </div>
-        <div>
-          <label className="text-xs font-medium text-primary-500 uppercase">Grade</label>
-          <input value={form.grade} onChange={e => setForm({...form, grade: e.target.value})} placeholder="2nd Grade" className="border-2 border-primary-200 rounded-xl px-3 py-2 mt-1 w-36 focus:outline-none focus:border-primary" />
-        </div>
-        <div>
-          <label className="text-xs font-medium text-primary-500 uppercase">Teacher</label>
-          <input value={form.teacher} onChange={e => setForm({...form, teacher: e.target.value})} placeholder="Mrs. Smith" className="border-2 border-primary-200 rounded-xl px-3 py-2 mt-1 w-40 focus:outline-none focus:border-primary" />
-        </div>
-        <PrimaryButton type="submit">Add Classroom</PrimaryButton>
-      </form>
+      <h3 className="text-xl font-bold text-primary-900 mb-4">Daily Verification &amp; Finalization</h3>
+      <div className="flex items-center gap-3 mb-6 flex-wrap">
+        <input type="date" value={dateVal} onChange={e => setDateVal(e.target.value)} className="border-2 border-primary-200 rounded-xl px-3 py-2" />
+        <PrimaryButton onClick={verifyAll}>Verify &amp; Finalize All Submitted</PrimaryButton>
+      </div>
 
-      <div className="grid sm:grid-cols-2 gap-4">
-        {data.classrooms.map(c => (
-          <div key={c.id} className="bg-white rounded-2xl card-shadow border border-primary-100 p-4">
-            {editingId === c.id ? (
-              <div className="flex flex-col gap-2">
-                <input value={editForm.name} onChange={e => setEditForm({...editForm, name: e.target.value})} className="border-2 border-primary-200 rounded-lg px-2 py-1" />
-                <input value={editForm.grade} onChange={e => setEditForm({...editForm, grade: e.target.value})} className="border-2 border-primary-200 rounded-lg px-2 py-1" />
-                <input value={editForm.teacher} onChange={e => setEditForm({...editForm, teacher: e.target.value})} className="border-2 border-primary-200 rounded-lg px-2 py-1" />
-                <div className="flex gap-2 mt-1">
-                  <button onClick={() => saveEdit(c.id)} className="flex-1 px-3 py-1.5 rounded-lg bg-primary text-white text-sm font-semibold">Save</button>
-                  <button onClick={() => setEditingId(null)} className="flex-1 px-3 py-1.5 rounded-lg bg-primary-50 text-primary text-sm font-semibold">Cancel</button>
+      {data.classrooms.length === 0 ? (
+        <p className="text-sm font-light text-primary-500">No classrooms yet.</p>
+      ) : (
+        <div className="grid gap-4">
+          {data.classrooms.map(cls => {
+            const roster = data.students.filter(s => s.classroomId === cls.id);
+            const log = data.logsById[logId(dateVal, cls.id)];
+            const preT = tallyEntries(log && log.pre && log.pre.entries, roster);
+            const finalT = tallyEntries(log && log.final && log.final.entries, roster);
+            const preSubmitted = !!(log && log.pre && log.pre.submitted);
+            const finalSubmitted = !!(log && log.final && log.final.submitted);
+            const verified = !!(log && log.verified);
+            const status = verified ? 'Verified' : (finalSubmitted ? 'Completed' : (preSubmitted ? 'In Progress' : 'Not Started'));
+            return (
+              <div key={cls.id} className="bg-white rounded-2xl card-shadow border border-primary-100 p-5">
+                <div className="flex justify-between items-start mb-4 flex-wrap gap-2">
+                  <div>
+                    <h4 className="font-bold text-primary-900">{classroomLabel(cls)}</h4>
+                    <p className="text-xs font-light text-primary-500">{roster.length} students</p>
+                  </div>
+                  <Badge status={status} />
+                </div>
+                <div className="grid sm:grid-cols-2 gap-4 mb-4">
+                  <div className="bg-primary-50 rounded-xl p-3">
+                    <p className="text-xs font-semibold text-primary-700 uppercase mb-1">Morning Pre-Count {preSubmitted ? '' : '(not submitted)'}</p>
+                    <p className="text-sm text-primary-800">Hot {preT.hot} &middot; Sack {preT.sack} &middot; Absent {preT.absent} &middot; White {preT.white} &middot; Choc. {preT.choc}</p>
+                  </div>
+                  <div className="bg-primary-50 rounded-xl p-3">
+                    <p className="text-xs font-semibold text-primary-700 uppercase mb-1">Lunchtime Final Count {finalSubmitted ? '' : '(not submitted)'}</p>
+                    <p className="text-sm text-primary-800">Hot {finalT.hot} &middot; Sack {finalT.sack} &middot; Absent {finalT.absent} &middot; White {finalT.white} &middot; Choc. {finalT.choc}</p>
+                  </div>
+                </div>
+                <div className="flex gap-2 justify-end">
+                  {verified ? (
+                    <GhostButton onClick={() => unverifyClassroom(cls)}>Unlock (Undo Verification)</GhostButton>
+                  ) : (
+                    <PrimaryButton disabled={!finalSubmitted} onClick={() => verifyClassroom(cls)}>Verify &amp; Finalize</PrimaryButton>
+                  )}
                 </div>
               </div>
-            ) : (
-              <div className="flex items-start justify-between">
-                <div>
-                  <p className="font-bold text-primary-900">{c.name}</p>
-                  <p className="text-sm font-medium text-primary-500">{c.grade} &middot; {c.teacher}</p>
-                  <p className="text-xs font-light text-primary-400 mt-1">{data.students.filter(s => s.classroomId === c.id).length} students</p>
-                </div>
-                <div className="flex flex-col gap-2">
-                  <button onClick={() => startEdit(c)} className="px-3 py-1.5 rounded-lg bg-primary-50 text-primary text-xs font-semibold hover:bg-primary-100">Edit</button>
-                  <button onClick={() => deleteClassroom(c.id)} className="px-3 py-1.5 rounded-lg bg-rose-50 text-rose-600 text-xs font-semibold hover:bg-rose-100">Delete</button>
-                </div>
-              </div>
-            )}
-          </div>
-        ))}
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ============================ ADMIN: TERM & CALENDAR SETTINGS ============================ */
+function TermSettingsPanel({ settings }) {
+  const [semesterStart, setSemesterStart] = useState(settings.semesterStart || '');
+  const [quarterStart, setQuarterStart] = useState(settings.quarterStart || '');
+  const [savedMsg, setSavedMsg] = useState('');
+
+  useEffect(() => {
+    setSemesterStart(settings.semesterStart || '');
+    setQuarterStart(settings.quarterStart || '');
+  }, [settings.semesterStart, settings.quarterStart]);
+
+  async function save() {
+    await saveSettings({ semesterStart, quarterStart });
+    setSavedMsg('Saved!');
+    setTimeout(() => setSavedMsg(''), 2000);
+  }
+
+  return (
+    <div>
+      <h3 className="text-xl font-bold text-primary-900 mb-4">Term &amp; Calendar Settings</h3>
+      <p className="text-sm font-light text-primary-600 mb-4">These dates scope the "This Quarter" and "This Semester" views in Analytics &amp; Reporting.</p>
+      <div className="bg-white rounded-2xl card-shadow border border-primary-100 p-5 flex flex-wrap gap-4 items-end">
+        <div>
+          <label className="text-xs font-medium text-primary-500 uppercase block mb-1">Start of Semester</label>
+          <input type="date" value={semesterStart} onChange={e => setSemesterStart(e.target.value)} className="border-2 border-primary-200 rounded-xl px-3 py-2" />
+        </div>
+        <div>
+          <label className="text-xs font-medium text-primary-500 uppercase block mb-1">Start of Quarter</label>
+          <input type="date" value={quarterStart} onChange={e => setQuarterStart(e.target.value)} className="border-2 border-primary-200 rounded-xl px-3 py-2" />
+        </div>
+        <PrimaryButton onClick={save}>Save Settings</PrimaryButton>
+        {savedMsg && <span className="text-sm font-semibold text-green-600">{savedMsg}</span>}
       </div>
     </div>
   );
 }
 
 /* ============================ ADMIN: ANALYTICS ============================ */
-function getSemesterRange(dateStr) {
-  const d = parseDateStr(dateStr);
-  const y = d.getFullYear();
-  // Fall: Aug 1 - Dec 31 ; Spring: Jan 1 - Jun 15
-  if (d.getMonth() >= 7) return { start: new Date(y, 7, 1), end: new Date(y, 11, 31), label: 'Fall ' + y };
-  return { start: new Date(y, 0, 1), end: new Date(y, 5, 15), label: 'Spring ' + y };
-}
-function getWeekRange(dateStr) {
-  const d = parseDateStr(dateStr);
-  const day = d.getDay();
-  const diffToMonday = (day === 0 ? -6 : 1) - day;
-  const monday = addDays(d, diffToMonday);
-  const friday = addDays(monday, 4);
-  return { start: monday, end: friday };
-}
-function getMonthRange(monthStr) {
-  const [y, m] = monthStr.split('-').map(Number);
-  return { start: new Date(y, m - 1, 1), end: new Date(y, m, 0) };
-}
-
-function aggregate(data, startDate, endDate) {
-  const result = {};
-  data.classrooms.forEach(c => { result[c.id] = { fullPortion: 0, white: 0, choc: 0, entryCount: 0, daysLogged: 0 }; });
-  Object.keys(data.logs).forEach(dateStr => {
-    const d = parseDateStr(dateStr);
-    if (d < startDate || d > endDate) return;
-    const dayLog = data.logs[dateStr];
-    Object.keys(dayLog).forEach(classroomId => {
-      const entryLog = dayLog[classroomId];
-      if (!entryLog || !entryLog.submitted || !result[classroomId]) return;
-      result[classroomId].daysLogged++;
-      Object.values(entryLog.entries).forEach(e => {
-        result[classroomId].entryCount++;
-        if (e.fullPortion) result[classroomId].fullPortion++;
-        if (e.milk === 'white') result[classroomId].white++;
-        if (e.milk === 'chocolate') result[classroomId].choc++;
-      });
-    });
-  });
-  return result;
-}
-
-function BarRow({ label, value, max, color }) {
-  const pct = max > 0 ? Math.round((value / max) * 100) : 0;
-  return (
-    <div className="mb-3">
-      <div className="flex justify-between text-sm font-medium text-primary-700 mb-1">
-        <span>{label}</span><span className="font-bold">{value}</span>
-      </div>
-      <div className="w-full bg-primary-50 rounded-full h-3 overflow-hidden">
-        <div className="h-3 rounded-full transition-fast" style={{ width: pct + '%', backgroundColor: color }}></div>
-      </div>
-    </div>
-  );
-}
-
 function AnalyticsDashboard({ data }) {
   const [range, setRange] = useState('daily');
   const [dateVal, setDateVal] = useState(todayStr());
   const [monthVal, setMonthVal] = useState(todayStr().slice(0,7));
-  const [semesterInfo, setSemesterInfo] = useState(null);
 
   let startDate, endDate, periodLabel;
   if (range === 'daily') {
@@ -748,32 +1035,36 @@ function AnalyticsDashboard({ data }) {
     periodLabel = formatDisplayDate(dateVal);
   } else if (range === 'weekly') {
     const wr = getWeekRange(dateVal); startDate = wr.start; endDate = wr.end;
-    periodLabel = formatShortDate(toDateStr(wr.start)) + ' – ' + formatShortDate(toDateStr(wr.end));
+    periodLabel = formatShortDate(toDateStr(wr.start)) + ' \u2013 ' + formatShortDate(toDateStr(wr.end));
   } else if (range === 'monthly') {
     const mr = getMonthRange(monthVal); startDate = mr.start; endDate = mr.end;
     periodLabel = mr.start.toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
+  } else if (range === 'quarter') {
+    if (!data.settings.quarterStart) { startDate = parseDateStr(todayStr()); endDate = startDate; periodLabel = 'No quarter start date set (Admin \u2192 Term Settings)'; }
+    else { const r = getRangeSince(data.settings.quarterStart, todayStr()); startDate = r.start; endDate = r.end; periodLabel = 'Since ' + formatShortDate(data.settings.quarterStart); }
   } else {
-    const sr = getSemesterRange(dateVal); startDate = sr.start; endDate = sr.end;
-    periodLabel = sr.label;
+    if (!data.settings.semesterStart) { startDate = parseDateStr(todayStr()); endDate = startDate; periodLabel = 'No semester start date set (Admin \u2192 Term Settings)'; }
+    else { const r = getRangeSince(data.settings.semesterStart, todayStr()); startDate = r.start; endDate = r.end; periodLabel = 'Since ' + formatShortDate(data.settings.semesterStart); }
   }
 
-  const agg = useMemo(() => aggregate(data, startDate, endDate), [data, startDate.getTime(), endDate.getTime()]);
+  const agg = useMemo(() => aggregateRange(data, startDate, endDate), [data, startDate.getTime(), endDate.getTime()]);
 
   const overall = useMemo(() => {
-    let full=0, white=0, choc=0, entryCount=0;
-    Object.values(agg).forEach(v => { full+=v.fullPortion; white+=v.white; choc+=v.choc; entryCount+=v.entryCount; });
-    const participation = entryCount > 0 ? Math.round((full/entryCount)*1000)/10 : 0;
-    return { full, white, choc, entryCount, participation };
+    let hot = 0, sack = 0, absent = 0, white = 0, choc = 0;
+    Object.values(agg).forEach(v => { hot += v.hot; sack += v.sack; absent += v.absent; white += v.white; choc += v.choc; });
+    const served = hot + sack;
+    const participation = (served + absent) > 0 ? Math.round((served / (served + absent)) * 1000) / 10 : 0;
+    return { hot, sack, absent, white, choc, participation };
   }, [agg]);
 
-  const maxFull = Math.max(1, ...data.classrooms.map(c => agg[c.id].fullPortion));
+  const maxHot = Math.max(1, ...data.classrooms.map(c => (agg[c.id] ? agg[c.id].hot : 0)));
 
   return (
     <div>
       <h3 className="text-xl font-bold text-primary-900 mb-4">Analytics &amp; Reporting</h3>
 
       <div className="flex flex-wrap gap-2 mb-4">
-        {[['daily','Daily'],['weekly','Weekly'],['monthly','Monthly'],['semester','By Semester']].map(([val,label]) => (
+        {[['daily','Daily'],['weekly','Weekly'],['monthly','Monthly'],['quarter','This Quarter'],['semester','This Semester']].map(([val,label]) => (
           <button
             key={val}
             onClick={() => setRange(val)}
@@ -783,7 +1074,7 @@ function AnalyticsDashboard({ data }) {
       </div>
 
       <div className="mb-6 flex items-center gap-3 flex-wrap">
-        {(range === 'daily' || range === 'weekly' || range === 'semester') && (
+        {(range === 'daily' || range === 'weekly') && (
           <input type="date" value={dateVal} onChange={e => setDateVal(e.target.value)} className="border-2 border-primary-200 rounded-xl px-3 py-2" />
         )}
         {range === 'monthly' && (
@@ -792,29 +1083,20 @@ function AnalyticsDashboard({ data }) {
         <span className="text-sm font-light italic text-primary-500">Showing: {periodLabel}</span>
       </div>
 
-      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-8">
-        <div className="bg-white rounded-2xl card-shadow p-4 text-center border border-primary-100">
-          <p className="text-3xl font-bold text-primary">{overall.full}</p>
-          <p className="text-xs font-medium text-primary-500 uppercase mt-1">Full Portions</p>
-        </div>
-        <div className="bg-white rounded-2xl card-shadow p-4 text-center border border-primary-100">
-          <p className="text-3xl font-bold text-primary">{overall.white}</p>
-          <p className="text-xs font-medium text-primary-500 uppercase mt-1">White Milk</p>
-        </div>
-        <div className="bg-white rounded-2xl card-shadow p-4 text-center border border-primary-100">
-          <p className="text-3xl font-bold text-primary">{overall.choc}</p>
-          <p className="text-xs font-medium text-primary-500 uppercase mt-1">Chocolate Milk</p>
-        </div>
-        <div className="bg-white rounded-2xl card-shadow p-4 text-center border border-primary-100">
-          <p className="text-3xl font-bold text-primary">{overall.participation}%</p>
-          <p className="text-xs font-medium text-primary-500 uppercase mt-1">Participation</p>
-        </div>
+      <div className="grid grid-cols-2 sm:grid-cols-5 gap-3 mb-8">
+        <StatCard label="Hot Lunches" value={overall.hot} />
+        <StatCard label="Sack Lunches" value={overall.sack} />
+        <StatCard label="Absences" value={overall.absent} />
+        <StatCard label="White Milk" value={overall.white} />
+        <StatCard label="Choc. Milk" value={overall.choc} />
       </div>
 
       <div className="bg-white rounded-2xl card-shadow border border-primary-100 p-5 mb-8">
-        <h4 className="font-semibold text-primary-800 mb-3">Full Portions by Classroom</h4>
-        {data.classrooms.map(c => (
-          <BarRow key={c.id} label={c.name} value={agg[c.id].fullPortion} max={maxFull} color="#3a5299" />
+        <h4 className="font-semibold text-primary-800 mb-3">Hot Lunches by Classroom</h4>
+        {data.classrooms.length === 0 ? (
+          <p className="text-sm font-light text-primary-500">No classrooms yet.</p>
+        ) : data.classrooms.map(c => (
+          <BarRow key={c.id} label={classroomLabel(c)} value={agg[c.id] ? agg[c.id].hot : 0} max={maxHot} color="#3a5299" />
         ))}
       </div>
 
@@ -823,27 +1105,28 @@ function AnalyticsDashboard({ data }) {
           <thead>
             <tr className="bg-primary-50 text-primary-700 text-left">
               <th className="p-3 font-semibold">Classroom</th>
-              <th className="p-3 font-semibold">Teacher</th>
               <th className="p-3 font-semibold text-right">Days Logged</th>
-              <th className="p-3 font-semibold text-right">Full Portions</th>
+              <th className="p-3 font-semibold text-right">Hot</th>
+              <th className="p-3 font-semibold text-right">Sack</th>
+              <th className="p-3 font-semibold text-right">Absent</th>
               <th className="p-3 font-semibold text-right">White Milk</th>
               <th className="p-3 font-semibold text-right">Choc. Milk</th>
-              <th className="p-3 font-semibold text-right">Participation %</th>
+              <th className="p-3 font-semibold text-right">Verified Days</th>
             </tr>
           </thead>
           <tbody className="divide-y divide-primary-50">
             {data.classrooms.map(c => {
-              const v = agg[c.id];
-              const pct = v.entryCount > 0 ? Math.round((v.fullPortion/v.entryCount)*1000)/10 : 0;
+              const v = agg[c.id] || { hot: 0, sack: 0, absent: 0, white: 0, choc: 0, daysLogged: 0, daysVerified: 0 };
               return (
                 <tr key={c.id}>
-                  <td className="p-3 font-medium text-primary-900">{c.name}</td>
-                  <td className="p-3 text-primary-600">{c.teacher}</td>
+                  <td className="p-3 font-medium text-primary-900">{classroomLabel(c)}</td>
                   <td className="p-3 text-right">{v.daysLogged}</td>
-                  <td className="p-3 text-right">{v.fullPortion}</td>
+                  <td className="p-3 text-right">{v.hot}</td>
+                  <td className="p-3 text-right">{v.sack}</td>
+                  <td className="p-3 text-right">{v.absent}</td>
                   <td className="p-3 text-right">{v.white}</td>
                   <td className="p-3 text-right">{v.choc}</td>
-                  <td className="p-3 text-right">{pct}%</td>
+                  <td className="p-3 text-right">{v.daysVerified}</td>
                 </tr>
               );
             })}
@@ -854,97 +1137,248 @@ function AnalyticsDashboard({ data }) {
   );
 }
 
-/* ============================ ADMIN: EXPORT ============================ */
-function ExportPanel({ data }) {
-  const [dateVal, setDateVal] = useState(todayStr());
+/* ============================ ADMIN: STUDENT MANAGEMENT ============================ */
+function StudentManagement({ data }) {
+  const [newName, setNewName] = useState('');
+  const [newClass, setNewClass] = useState(data.classrooms[0] ? data.classrooms[0].id : '');
+  const [editingId, setEditingId] = useState(null);
+  const [editName, setEditName] = useState('');
 
-  const rows = useMemo(() => {
-    return data.classrooms.map(c => {
-      const roster = data.students.filter(s => s.classroomId === c.id);
-      const log = data.logs[dateVal] && data.logs[dateVal][c.id];
-      if (!log || !log.submitted) {
-        return { name: c.name, teacher: c.teacher, grade: c.grade, total: roster.length, full: 0, white: 0, choc: 0, pct: '', status: 'Not Submitted' };
-      }
-      let full=0, white=0, choc=0;
-      Object.values(log.entries).forEach(e => { if (e.fullPortion) full++; if (e.milk==='white') white++; if (e.milk==='chocolate') choc++; });
-      const pct = roster.length > 0 ? Math.round((full/roster.length)*1000)/10 : 0;
-      return { name: c.name, teacher: c.teacher, grade: c.grade, total: roster.length, full, white, choc, pct: pct + '%', status: 'Submitted' };
-    });
-  }, [data, dateVal]);
+  useEffect(() => {
+    if (!newClass && data.classrooms[0]) setNewClass(data.classrooms[0].id);
+    // eslint-disable-next-line
+  }, [data.classrooms]);
 
-  function downloadCsv() {
-    const header = ['Classroom','Teacher','Grade','Total Students','Full Portions','White Milk','Chocolate Milk','Participation %','Status'];
-    const lines = [header.join(',')];
-    rows.forEach(r => {
-      lines.push([r.name, r.teacher, r.grade, r.total, r.full, r.white, r.choc, r.pct, r.status].map(v => '"' + String(v).replace(/"/g,'""') + '"').join(','));
-    });
-    const csv = lines.join('\n');
-    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = 'lunch-totals-' + dateVal + '.csv';
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
+  async function addStudent(e) {
+    e.preventDefault();
+    if (!newName.trim() || !newClass) return;
+    await saveStudent({ name: newName.trim(), classroomId: newClass });
+    setNewName('');
+  }
+
+  async function deleteStudent(id) {
+    if (!confirm('Remove this student? This cannot be undone.')) return;
+    await deleteStudentDoc(id);
+  }
+
+  async function moveStudent(id, classroomId) {
+    const s = data.students.find(x => x.id === id);
+    if (!s) return;
+    await saveStudent({ id, name: s.name, classroomId });
+  }
+
+  function startEdit(s) { setEditingId(s.id); setEditName(s.name); }
+  async function saveEdit(id) {
+    const s = data.students.find(x => x.id === id);
+    if (!s) return;
+    await saveStudent({ id, name: editName.trim() || s.name, classroomId: s.classroomId });
+    setEditingId(null);
   }
 
   return (
     <div>
-      <h3 className="text-xl font-bold text-primary-900 mb-4">Export Daily Totals</h3>
-      <div className="flex items-center gap-3 mb-6 flex-wrap">
-        <input type="date" value={dateVal} onChange={e => setDateVal(e.target.value)} className="border-2 border-primary-200 rounded-xl px-3 py-2" />
-        <PrimaryButton onClick={downloadCsv}>Download CSV</PrimaryButton>
+      <h3 className="text-xl font-bold text-primary-900 mb-4">Student Management</h3>
+
+      {data.classrooms.length === 0 ? (
+        <p className="text-sm font-light text-primary-500 mb-4">Add a classroom first before adding students.</p>
+      ) : (
+        <form onSubmit={addStudent} className="bg-white rounded-2xl card-shadow p-4 border border-primary-100 mb-6 flex flex-wrap gap-3 items-end">
+          <div className="flex-1 min-w-[180px]">
+            <label className="text-xs font-medium text-primary-500 uppercase">New Student Name</label>
+            <input value={newName} onChange={e => setNewName(e.target.value)} placeholder="e.g. Grace Miller" className="w-full border-2 border-primary-200 rounded-xl px-3 py-2 mt-1 focus:outline-none focus:border-primary" />
+          </div>
+          <div>
+            <label className="text-xs font-medium text-primary-500 uppercase">Classroom</label>
+            <select value={newClass} onChange={e => setNewClass(e.target.value)} className="w-full border-2 border-primary-200 rounded-xl px-3 py-2 mt-1 focus:outline-none focus:border-primary">
+              {data.classrooms.map(c => <option key={c.id} value={c.id}>{classroomLabel(c)}</option>)}
+            </select>
+          </div>
+          <PrimaryButton type="submit">Add Student</PrimaryButton>
+        </form>
+      )}
+
+      <div className="bg-white rounded-2xl card-shadow border border-primary-100 divide-y divide-primary-50 overflow-hidden">
+        {data.students.length === 0 && <p className="p-4 text-sm font-light text-primary-500">No students yet.</p>}
+        {data.students.map(s => (
+          <div key={s.id} className="flex items-center gap-3 p-4 flex-wrap">
+            <Avatar name={s.name} size={40} />
+            {editingId === s.id ? (
+              <input value={editName} onChange={e => setEditName(e.target.value)} className="border-2 border-primary-200 rounded-lg px-2 py-1 flex-1 min-w-[140px]" autoFocus />
+            ) : (
+              <p className="font-medium text-primary-900 flex-1 min-w-[140px]">{s.name}</p>
+            )}
+            <select
+              value={s.classroomId}
+              onChange={e => moveStudent(s.id, e.target.value)}
+              className="border-2 border-primary-200 rounded-lg px-2 py-1 text-sm"
+            >
+              {data.classrooms.map(c => <option key={c.id} value={c.id}>{classroomLabel(c)}</option>)}
+            </select>
+            {editingId === s.id ? (
+              <button onClick={() => saveEdit(s.id)} className="px-3 py-1.5 rounded-lg bg-primary text-white text-sm font-semibold">Save</button>
+            ) : (
+              <button onClick={() => startEdit(s)} className="px-3 py-1.5 rounded-lg bg-primary-50 text-primary text-sm font-semibold hover:bg-primary-100">Edit</button>
+            )}
+            <button onClick={() => deleteStudent(s.id)} className="px-3 py-1.5 rounded-lg bg-rose-50 text-rose-600 text-sm font-semibold hover:bg-rose-100">Delete</button>
+          </div>
+        ))}
       </div>
-      <div className="bg-white rounded-2xl card-shadow border border-primary-100 overflow-x-auto">
-        <table className="w-full text-sm">
-          <thead>
-            <tr className="bg-primary-50 text-primary-700 text-left">
-              <th className="p-3 font-semibold">Classroom</th>
-              <th className="p-3 font-semibold">Teacher</th>
-              <th className="p-3 font-semibold text-right">Total</th>
-              <th className="p-3 font-semibold text-right">Full Portions</th>
-              <th className="p-3 font-semibold text-right">White Milk</th>
-              <th className="p-3 font-semibold text-right">Choc. Milk</th>
-              <th className="p-3 font-semibold text-right">Participation</th>
-              <th className="p-3 font-semibold text-right">Status</th>
-            </tr>
-          </thead>
-          <tbody className="divide-y divide-primary-50">
-            {rows.map(r => (
-              <tr key={r.name}>
-                <td className="p-3 font-medium text-primary-900">{r.name}</td>
-                <td className="p-3 text-primary-600">{r.teacher}</td>
-                <td className="p-3 text-right">{r.total}</td>
-                <td className="p-3 text-right">{r.full}</td>
-                <td className="p-3 text-right">{r.white}</td>
-                <td className="p-3 text-right">{r.choc}</td>
-                <td className="p-3 text-right">{r.pct}</td>
-                <td className="p-3 text-right">
-                  <span className={"text-xs font-semibold px-2 py-1 rounded-full " + (r.status === 'Submitted' ? 'bg-green-100 text-green-700' : 'bg-gray-100 text-gray-500')}>{r.status}</span>
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+    </div>
+  );
+}
+
+/* ============================ ADMIN: CLASSROOM MANAGEMENT ============================ */
+function ClassroomManagement({ data }) {
+  const [form, setForm] = useState({ grade: '', teacher: '' });
+  const [editingId, setEditingId] = useState(null);
+  const [editForm, setEditForm] = useState({ grade: '', teacher: '' });
+
+  async function addClassroom(e) {
+    e.preventDefault();
+    if (!form.grade.trim() || !form.teacher.trim()) return;
+    await saveClassroom({ grade: form.grade.trim(), teacher: form.teacher.trim() });
+    setForm({ grade: '', teacher: '' });
+  }
+
+  async function deleteClassroom(id) {
+    const hasStudents = data.students.some(s => s.classroomId === id);
+    if (hasStudents) { alert('Cannot delete a classroom that still has students assigned. Move students first.'); return; }
+    if (!confirm('Delete this classroom?')) return;
+    await deleteClassroomDoc(id);
+  }
+
+  function startEdit(c) { setEditingId(c.id); setEditForm({ grade: c.grade, teacher: c.teacher }); }
+  async function saveEdit(id) {
+    await saveClassroom({ id, grade: editForm.grade.trim(), teacher: editForm.teacher.trim() });
+    setEditingId(null);
+  }
+
+  return (
+    <div>
+      <h3 className="text-xl font-bold text-primary-900 mb-4">Classroom Management</h3>
+      <p className="text-sm font-light text-primary-600 mb-4">Classrooms are identified by grade and teacher only.</p>
+      <form onSubmit={addClassroom} className="bg-white rounded-2xl card-shadow p-4 border border-primary-100 mb-6 flex flex-wrap gap-3 items-end">
+        <div>
+          <label className="text-xs font-medium text-primary-500 uppercase">Grade</label>
+          <input value={form.grade} onChange={e => setForm({ ...form, grade: e.target.value })} placeholder="2nd Grade" className="border-2 border-primary-200 rounded-xl px-3 py-2 mt-1 w-40 focus:outline-none focus:border-primary" />
+        </div>
+        <div>
+          <label className="text-xs font-medium text-primary-500 uppercase">Teacher</label>
+          <input value={form.teacher} onChange={e => setForm({ ...form, teacher: e.target.value })} placeholder="Mrs. Smith" className="border-2 border-primary-200 rounded-xl px-3 py-2 mt-1 w-48 focus:outline-none focus:border-primary" />
+        </div>
+        <PrimaryButton type="submit">Add Classroom</PrimaryButton>
+      </form>
+
+      <div className="grid sm:grid-cols-2 gap-4">
+        {data.classrooms.length === 0 && <p className="text-sm font-light text-primary-500">No classrooms yet.</p>}
+        {data.classrooms.map(c => (
+          <div key={c.id} className="bg-white rounded-2xl card-shadow border border-primary-100 p-4">
+            {editingId === c.id ? (
+              <div className="flex flex-col gap-2">
+                <input value={editForm.grade} onChange={e => setEditForm({ ...editForm, grade: e.target.value })} className="border-2 border-primary-200 rounded-lg px-2 py-1" placeholder="Grade" />
+                <input value={editForm.teacher} onChange={e => setEditForm({ ...editForm, teacher: e.target.value })} className="border-2 border-primary-200 rounded-lg px-2 py-1" placeholder="Teacher" />
+                <div className="flex gap-2 mt-1">
+                  <button onClick={() => saveEdit(c.id)} className="px-3 py-1.5 rounded-lg bg-primary text-white text-sm font-semibold">Save</button>
+                  <button onClick={() => setEditingId(null)} className="px-3 py-1.5 rounded-lg bg-gray-100 text-gray-600 text-sm font-semibold">Cancel</button>
+                </div>
+              </div>
+            ) : (
+              <div className="flex justify-between items-center flex-wrap gap-2">
+                <div>
+                  <p className="font-bold text-primary-900">{c.grade}</p>
+                  <p className="text-sm text-primary-600 font-light">{c.teacher}</p>
+                  <p className="text-xs text-primary-400 font-light mt-1">{data.students.filter(s => s.classroomId === c.id).length} students</p>
+                </div>
+                <div className="flex gap-2">
+                  <button onClick={() => startEdit(c)} className="px-3 py-1.5 rounded-lg bg-primary-50 text-primary text-sm font-semibold hover:bg-primary-100">Edit</button>
+                  <button onClick={() => deleteClassroom(c.id)} className="px-3 py-1.5 rounded-lg bg-rose-50 text-rose-600 text-sm font-semibold hover:bg-rose-100">Delete</button>
+                </div>
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/* ============================ ADMIN: EXPORT (GOOGLE SHEETS) ============================ */
+function ExportPanel({ data }) {
+  const [dailyDate, setDailyDate] = useState(todayStr());
+  const [weeklyDate, setWeeklyDate] = useState(todayStr());
+  const [monthlyMonth, setMonthlyMonth] = useState(todayStr().slice(0,7));
+
+  function exportDaily() {
+    const rows = buildDailyExportRows(data, dailyDate);
+    downloadTSV('lunch-daily-' + dailyDate + '.tsv', rows);
+  }
+  function exportWeekly() {
+    const rows = buildWeeklyExportRows(data, weeklyDate);
+    const wr = getWeekRange(weeklyDate);
+    downloadTSV('lunch-weekly-' + toDateStr(wr.start) + '.tsv', rows);
+  }
+  function exportMonthly() {
+    const rows = buildMonthlyExportRows(data, monthlyMonth);
+    downloadTSV('lunch-monthly-' + monthlyMonth + '.tsv', rows);
+  }
+
+  return (
+    <div className="space-y-8">
+      <p className="text-sm font-light text-primary-600">
+        Each report downloads as a .tsv (tab-separated) file. Open it directly, or in Google Sheets choose
+        File &rarr; Import &rarr; Upload and select "Tab" as the separator for a clean import.
+      </p>
+
+      <div className="bg-white rounded-2xl card-shadow border border-primary-100 p-5">
+        <h3 className="text-lg font-bold text-primary-900 mb-2">Daily Final Export</h3>
+        <p className="text-sm font-light text-primary-600 mb-3">Student-level final counts plus a pre-count vs. final-count summary.</p>
+        <div className="flex items-center gap-3 flex-wrap">
+          <input type="date" value={dailyDate} onChange={e => setDailyDate(e.target.value)} className="border-2 border-primary-200 rounded-xl px-3 py-2" />
+          <PrimaryButton onClick={exportDaily}>Download Daily Export</PrimaryButton>
+        </div>
+      </div>
+
+      <div className="bg-white rounded-2xl card-shadow border border-primary-100 p-5">
+        <h3 className="text-lg font-bold text-primary-900 mb-2">Weekly Export</h3>
+        <p className="text-sm font-light text-primary-600 mb-3">Daily breakdown per student for the selected week, with weekly summary totals.</p>
+        <div className="flex items-center gap-3 flex-wrap">
+          <input type="date" value={weeklyDate} onChange={e => setWeeklyDate(e.target.value)} className="border-2 border-primary-200 rounded-xl px-3 py-2" />
+          <PrimaryButton onClick={exportWeekly}>Download Weekly Export</PrimaryButton>
+        </div>
+      </div>
+
+      <div className="bg-white rounded-2xl card-shadow border border-primary-100 p-5">
+        <h3 className="text-lg font-bold text-primary-900 mb-2">Monthly Export</h3>
+        <p className="text-sm font-light text-primary-600 mb-3">Week-by-week breakdown per student across the month, with monthly summary totals.</p>
+        <div className="flex items-center gap-3 flex-wrap">
+          <input type="month" value={monthlyMonth} onChange={e => setMonthlyMonth(e.target.value)} className="border-2 border-primary-200 rounded-xl px-3 py-2" />
+          <PrimaryButton onClick={exportMonthly}>Download Monthly Export</PrimaryButton>
+        </div>
       </div>
     </div>
   );
 }
 
 /* ============================ ADMIN PANEL ============================ */
-function AdminPanel({ data, persist, onResetData }) {
-  const [tab, setTab] = useState('analytics');
+function AdminPanel({ data, authUser, onLogout }) {
+  const [tab, setTab] = useState('verification');
   const tabs = [
+    ['verification', 'Verification'],
     ['analytics', 'Analytics'],
+    ['settings', 'Term Settings'],
     ['students', 'Students'],
     ['classrooms', 'Classrooms'],
     ['export', 'Export']
   ];
   return (
     <div className="max-w-6xl mx-auto px-4 sm:px-6 py-8">
-      <h2 className="text-2xl font-bold text-primary-900 mb-6">Admin Dashboard</h2>
+      <div className="flex justify-between items-start mb-6 flex-wrap gap-3">
+        <h2 className="text-2xl font-bold text-primary-900">Admin Dashboard</h2>
+        <div className="text-right">
+          <p className="text-xs text-primary-500 font-light">Signed in as {authUser && authUser.email}</p>
+          <button onClick={onLogout} className="text-xs font-semibold text-primary hover:underline">Log Out</button>
+        </div>
+      </div>
       <div className="flex gap-2 mb-6 flex-wrap">
         {tabs.map(([val,label]) => (
           <button
@@ -955,48 +1389,77 @@ function AdminPanel({ data, persist, onResetData }) {
         ))}
       </div>
 
+      {tab === 'verification' && <VerificationPanel data={data} />}
       {tab === 'analytics' && <AnalyticsDashboard data={data} />}
-      {tab === 'students' && <StudentManagement data={data} persist={persist} />}
-      {tab === 'classrooms' && <ClassroomManagement data={data} persist={persist} />}
+      {tab === 'settings' && <TermSettingsPanel settings={data.settings} />}
+      {tab === 'students' && <StudentManagement data={data} />}
+      {tab === 'classrooms' && <ClassroomManagement data={data} />}
       {tab === 'export' && <ExportPanel data={data} />}
+    </div>
+  );
+}
 
-      <div className="mt-12 pt-6 border-t border-primary-100">
-        <button
-          onClick={onResetData}
-          className="text-xs font-light italic text-primary-400 hover:text-rose-500 hover:underline"
-        >
-          Reset demo data (clears all logged entries and restores sample data)
-        </button>
-      </div>
+/* ============================ SETUP SCREEN (NO FIREBASE CONFIG YET) ============================ */
+function SetupRequiredScreen() {
+  return (
+    <div className="max-w-2xl mx-auto px-6 py-16">
+      <h2 className="text-2xl font-bold text-primary-900 mb-3 text-center">Connect Firebase to get started</h2>
+      <p className="text-primary-600 font-light mb-6 text-center">
+        This app stores all data in Firebase so every teacher and admin sees the same live counts.
+        Open the &lt;script&gt; block near the top of this file and replace the <code>firebaseConfig</code> placeholder
+        values with your project's config.
+      </p>
+      <ol className="text-sm text-primary-700 font-light list-decimal list-inside space-y-2 bg-white rounded-2xl card-shadow p-6 border border-primary-100">
+        <li>Create a project at console.firebase.google.com</li>
+        <li>Enable Cloud Firestore (Build &rarr; Firestore Database)</li>
+        <li>Enable Authentication &rarr; Sign-in method &rarr; Email/Password</li>
+        <li>Create at least one admin user under Authentication &rarr; Users</li>
+        <li>Copy your Web App config into <code>firebaseConfig</code> in this file</li>
+        <li>Apply the suggested Firestore security rules included as a comment near the config</li>
+      </ol>
     </div>
   );
 }
 
 /* ============================ ROOT APP ============================ */
-function App() {
-  const [data, setData] = useState(loadInitialData);
+function ConnectedApp() {
+  const { items: classrooms, loading: classroomsLoading } = useCollection('classrooms');
+  const { items: students, loading: studentsLoading } = useCollection('students');
+  const { settings, loading: settingsLoading } = useSettingsDoc();
+  const { logs, logsById, loading: logsLoading } = useLogs();
+
+  const [authUser, setAuthUser] = useState(null);
+  const [authChecked, setAuthChecked] = useState(false);
   const [role, setRole] = useState('teacher');
   const [showLogin, setShowLogin] = useState(false);
   const [view, setView] = useState({ screen: 'overview', classroomId: null });
 
-  const persist = useCallback((newData) => {
-    setData(newData);
-    saveData(newData);
+  useEffect(() => {
+    const unsub = auth.onAuthStateChanged(u => {
+      setAuthUser(u);
+      setAuthChecked(true);
+      if (!u) setRole('teacher');
+    });
+    return () => unsub();
   }, []);
 
   function requestRole(r) {
-    if (r === 'admin' && role !== 'admin') { setShowLogin(true); return; }
-    setRole(r);
-    if (r === 'teacher') setView({ screen: 'overview', classroomId: null });
-  }
-
-  function resetData() {
-    if (!confirm('This will erase all saved lunch data and restore the original sample data. Continue?')) return;
-    localStorage.removeItem(STORAGE_KEY);
-    const fresh = loadInitialData();
-    setData(fresh);
+    if (r === 'admin') {
+      if (authUser) setRole('admin'); else setShowLogin(true);
+      return;
+    }
+    setRole('teacher');
     setView({ screen: 'overview', classroomId: null });
   }
+
+  function handleLogout() {
+    auth.signOut();
+    setRole('teacher');
+    setView({ screen: 'overview', classroomId: null });
+  }
+
+  const data = { classrooms, students, settings, logs, logsById };
+  const stillLoading = classroomsLoading || studentsLoading || settingsLoading || logsLoading || !authChecked;
 
   return (
     <div className="min-h-screen">
@@ -1009,36 +1472,48 @@ function App() {
         />
       )}
 
-      {role === 'teacher' && view.screen === 'overview' && (
-        <TeacherOverview data={data} onOpenClassroom={(id) => setView({ screen: 'roster', classroomId: id })} />
-      )}
-      {role === 'teacher' && view.screen === 'roster' && (
-        <ClassroomRoster
-          data={data}
-          classroomId={view.classroomId}
-          persist={persist}
-          onBack={() => setView({ screen: 'overview', classroomId: null })}
-          onReview={(id) => setView({ screen: 'review', classroomId: id })}
-        />
-      )}
-      {role === 'teacher' && view.screen === 'review' && (
-        <ReviewScreen
-          data={data}
-          classroomId={view.classroomId}
-          onEdit={(id) => setView({ screen: 'roster', classroomId: id })}
-          onSubmit={(newData) => { persist(newData); setView({ screen: 'overview', classroomId: null }); }}
-        />
-      )}
-
-      {role === 'admin' && (
-        <AdminPanel data={data} persist={persist} onResetData={resetData} />
+      {stillLoading ? (
+        <div className="max-w-6xl mx-auto px-6 py-24 text-center text-primary-500 font-light">Loading live data&hellip;</div>
+      ) : (
+        <React.Fragment>
+          {role === 'teacher' && view.screen === 'overview' && (
+            <TeacherOverview data={data} onOpenClassroom={(id) => setView({ screen: 'workspace', classroomId: id })} />
+          )}
+          {role === 'teacher' && view.screen === 'workspace' && (
+            <ClassroomWorkspace
+              key={view.classroomId}
+              data={data}
+              classroomId={view.classroomId}
+              onBack={() => setView({ screen: 'overview', classroomId: null })}
+            />
+          )}
+          {role === 'admin' && authUser && (
+            <AdminPanel data={data} authUser={authUser} onLogout={handleLogout} />
+          )}
+        </React.Fragment>
       )}
 
       <footer className="text-center text-xs font-light text-primary-400 py-8">
-        Lunch Tracker Prototype &middot; Built for demonstration purposes
+        Lunch Tracker &middot; Synced live via Firebase
       </footer>
     </div>
   );
+}
+
+function App() {
+  if (FIREBASE_NOT_CONFIGURED) {
+    return (
+      <div className="min-h-screen">
+        <div className="bg-primary text-white">
+          <div className="max-w-6xl mx-auto px-4 sm:px-6 py-4">
+            <h1 className="text-2xl font-bold leading-tight">\uD83C\uDF7D\uFE0F Lunch Tracker</h1>
+          </div>
+        </div>
+        <SetupRequiredScreen />
+      </div>
+    );
+  }
+  return <ConnectedApp />;
 }
 
 const root = ReactDOM.createRoot(document.getElementById('root'));
