@@ -551,9 +551,16 @@ function NavBar({ role, onRequestRole, currentDate }) {
   return (
     <div className="bg-primary text-white sticky top-0 z-40 card-shadow">
       <div className="max-w-6xl mx-auto px-4 sm:px-6 py-4 flex items-center justify-between flex-wrap gap-3">
-        <div>
-          <h1 className="text-2xl font-bold leading-tight">\uD83C\uDF7D\uFE0F Lunch Tracker</h1>
-          <p className="text-xs font-light text-primary-100 italic">{formatDisplayDate(currentDate)}</p>
+        <div className="flex items-center gap-3">
+          <img 
+            src="counting-loaves/logo-school.png" 
+            alt="St. Mary Catholic School Logo" 
+            className="h-10 w-auto" 
+          />
+          <div>
+            <h1 className="text-2xl font-bold leading-tight">St. Mary Catholic School Lunch Tracker</h1>
+            <p className="text-xs font-light text-primary-100 italic">{formatDisplayDate(currentDate)}</p>
+          </div>
         </div>
         <div className="flex bg-primary-700 rounded-xl p-1 gap-1">
           <button
