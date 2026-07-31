@@ -113,10 +113,9 @@ if (!FIREBASE_NOT_CONFIGURED) {
 }
 
 /* ============================ CONSTANTS ============================ */
-const AVATAR_COLORS = ['#3a5299','#5f78b2','#8fa2d0','#c98a3a','#3a9970','#993a5e','#8a3a99','#3a8f99'];
 const DAILY_PASSWORD = 'countingloaves';
 const DEVICE_AUTH_STORAGE_KEY = 'countingloaves_device_auth_date';
-const TERM_KEYS = ['Q1','Q2','Q3','Q4','S1','S2'];
+const TERM_KEYS = ['S1','S2','Q1','Q2','Q3','Q4'];
 const TERM_LABELS = { Q1: 'Quarter 1', Q2: 'Quarter 2', Q3: 'Quarter 3', Q4: 'Quarter 4', S1: 'Semester 1', S2: 'Semester 2' };
 
 /* ============================ HELPERS ============================ */
@@ -133,32 +132,33 @@ function formatShortDate(dateStr) {
   const d = parseDateStr(dateStr);
   return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
 }
-function initials(name) {
-  return name.split(' ').map(p => p[0]).join('').slice(0,2).toUpperCase();
-}
-function colorForName(name) {
-  let hash = 0;
-  for (let i = 0; i < name.length; i++) hash = name.charCodeAt(i) + ((hash << 5) - hash);
-  return AVATAR_COLORS[Math.abs(hash) % AVATAR_COLORS.length];
-}
 function uid(prefix) { return prefix + '_' + Math.random().toString(36).slice(2,9); }
 function classroomLabel(cls) { return cls ? (cls.grade + ' — ' + cls.teacher) : 'Unknown Classroom'; }
 function logId(dateStr, classroomId) { return dateStr + '__' + classroomId; }
-function defaultEntry() { return { absent: false, meal: 'hot', milk: 'none' }; }
+function studentName(s) { return s ? (s.firstName + ' ' + s.lastName) : ''; }
+function studentNumberOf(s) { return (s && s.number != null) ? s.number : 0; }
+function sortStudents(list, sortBy) {
+  const arr = (list || []).slice();
+  if (sortBy === 'first') arr.sort((a,b) => a.firstName.localeCompare(b.firstName) || a.lastName.localeCompare(b.lastName));
+  else if (sortBy === 'last') arr.sort((a,b) => a.lastName.localeCompare(b.lastName) || a.firstName.localeCompare(b.firstName));
+  else arr.sort((a,b) => studentNumberOf(a) - studentNumberOf(b));
+  return arr;
+}
+function defaultEntry() { return { absent: false, meal: 'hot', milk: 'yes' }; }
 function emptyEntries(roster) {
   const e = {};
   roster.forEach(s => { e[s.id] = defaultEntry(); });
   return e;
 }
 function tallyEntries(entries, roster) {
-  let hot = 0, sack = 0, absent = 0, white = 0, choc = 0;
+  let hot = 0, sack = 0, absent = 0, milk = 0;
   roster.forEach(s => {
     const e = (entries && entries[s.id]) || defaultEntry();
     if (e.absent) { absent++; return; }
     if (e.meal === 'hot') hot++; else if (e.meal === 'sack') sack++;
-    if (e.milk === 'white') white++; else if (e.milk === 'chocolate') choc++;
+    if (e.milk === 'yes') milk++;
   });
-  return { hot, sack, absent, white, choc, total: roster.length };
+  return { hot, sack, absent, milk, total: roster.length };
 }
 function entryChanged(preE, finalE) {
   const a = preE || defaultEntry(), b = finalE || defaultEntry();
@@ -170,7 +170,7 @@ function entryStatusLabel(e) {
 }
 function entryMilkLabel(e) {
   if (e.absent) return '—';
-  return e.milk === 'none' ? 'No Milk' : (e.milk === 'white' ? 'White Milk' : 'Chocolate Milk');
+  return e.milk === 'yes' ? 'Yes' : 'No';
 }
 function getWeekRange(dateStr) {
   const d = parseDateStr(dateStr);
@@ -259,7 +259,7 @@ async function deleteClassroomDoc(id) { await db.collection('classrooms').doc(id
 
 async function saveStudent(s) {
   const id = s.id || uid('s');
-  await db.collection('students').doc(id).set({ name: s.name, classroomId: s.classroomId });
+  await db.collection('students').doc(id).set({ number: s.number, firstName: s.firstName, lastName: s.lastName, classroomId: s.classroomId });
   return id;
 }
 async function deleteStudentDoc(id) { await db.collection('students').doc(id).delete(); }
@@ -287,7 +287,7 @@ async function saveLogFull(dateStr, classroomId, obj) {
 /* ============================ AGGREGATION (ANALYTICS + EXPORT) ============================ */
 function aggregateRange(data, startDate, endDate) {
   const result = {};
-  data.classrooms.forEach(c => { result[c.id] = { hot: 0, sack: 0, absent: 0, white: 0, choc: 0 }; });
+  data.classrooms.forEach(c => { result[c.id] = { hot: 0, sack: 0, absent: 0, milk: 0 }; });
   data.logs.forEach(log => {
     const d = parseDateStr(log.date);
     if (d < startDate || d > endDate) return;
@@ -298,14 +298,13 @@ function aggregateRange(data, startDate, endDate) {
     result[log.classroomId].hot += t.hot;
     result[log.classroomId].sack += t.sack;
     result[log.classroomId].absent += t.absent;
-    result[log.classroomId].white += t.white;
-    result[log.classroomId].choc += t.choc;
+    result[log.classroomId].milk += t.milk;
   });
   return result;
 }
 function aggregateRangeByStudent(data, startDate, endDate) {
   const result = {};
-  data.students.forEach(s => { result[s.id] = { hot: 0, sack: 0, absent: 0, white: 0, choc: 0 }; });
+  data.students.forEach(s => { result[s.id] = { hot: 0, sack: 0, absent: 0, milk: 0 }; });
   data.logs.forEach(log => {
     const d = parseDateStr(log.date);
     if (d < startDate || d > endDate) return;
@@ -316,7 +315,7 @@ function aggregateRangeByStudent(data, startDate, endDate) {
       const e = (log.final.entries && log.final.entries[s.id]) || defaultEntry();
       if (e.absent) { result[s.id].absent++; return; }
       if (e.meal === 'hot') result[s.id].hot++; else result[s.id].sack++;
-      if (e.milk === 'white') result[s.id].white++; else if (e.milk === 'chocolate') result[s.id].choc++;
+      if (e.milk === 'yes') result[s.id].milk++;
     });
   });
   return result;
@@ -352,30 +351,30 @@ function buildRangeExportRows(data, startDate, endDate, rangeLabel) {
   rows.push(['Generated', formatDisplayDate(todayStr())]);
   rows.push([]);
   rows.push(['Classroom Summary (Final Counts Only)']);
-  rows.push(['Classroom', 'Grade', 'Teacher', 'Hot Lunch', 'Sack Lunch', 'Absent', 'White Milk', 'Chocolate Milk', 'Total Students']);
+  rows.push(['Classroom', 'Grade', 'Teacher', 'Hot Lunch', 'Sack Lunch', 'Absent', 'Milk', 'Total Students']);
 
   const agg = aggregateRange(data, startDate, endDate);
-  const grand = { hot: 0, sack: 0, absent: 0, white: 0, choc: 0, total: 0 };
+  const grand = { hot: 0, sack: 0, absent: 0, milk: 0, total: 0 };
 
   data.classrooms.forEach(cls => {
     const roster = data.students.filter(s => s.classroomId === cls.id);
-    const v = agg[cls.id] || { hot: 0, sack: 0, absent: 0, white: 0, choc: 0 };
-    rows.push([classroomLabel(cls), cls.grade, cls.teacher, v.hot, v.sack, v.absent, v.white, v.choc, roster.length]);
-    grand.hot += v.hot; grand.sack += v.sack; grand.absent += v.absent; grand.white += v.white; grand.choc += v.choc;
+    const v = agg[cls.id] || { hot: 0, sack: 0, absent: 0, milk: 0 };
+    rows.push([classroomLabel(cls), cls.grade, cls.teacher, v.hot, v.sack, v.absent, v.milk, roster.length]);
+    grand.hot += v.hot; grand.sack += v.sack; grand.absent += v.absent; grand.milk += v.milk;
     grand.total += roster.length;
   });
-  rows.push(['GRAND TOTAL', '', '', grand.hot, grand.sack, grand.absent, grand.white, grand.choc, grand.total]);
+  rows.push(['GRAND TOTAL', '', '', grand.hot, grand.sack, grand.absent, grand.milk, grand.total]);
 
   rows.push([]);
   rows.push(['Student-Level Detail (Final Counts Only)']);
-  rows.push(['Classroom', 'Grade', 'Teacher', 'Student', 'Hot Lunch', 'Sack Lunch', 'Absent Days', 'White Milk', 'Chocolate Milk']);
+  rows.push(['Classroom', 'Grade', 'Teacher', 'Student #', 'First Name', 'Last Name', 'Hot Lunch', 'Sack Lunch', 'Absent Days', 'Milk']);
 
   const studentAgg = aggregateRangeByStudent(data, startDate, endDate);
   data.classrooms.forEach(cls => {
-    const roster = data.students.filter(s => s.classroomId === cls.id);
+    const roster = sortStudents(data.students.filter(s => s.classroomId === cls.id), 'number');
     roster.forEach(s => {
-      const v = studentAgg[s.id] || { hot: 0, sack: 0, absent: 0, white: 0, choc: 0 };
-      rows.push([classroomLabel(cls), cls.grade, cls.teacher, s.name, v.hot, v.sack, v.absent, v.white, v.choc]);
+      const v = studentAgg[s.id] || { hot: 0, sack: 0, absent: 0, milk: 0 };
+      rows.push([classroomLabel(cls), cls.grade, cls.teacher, s.number, s.firstName, s.lastName, v.hot, v.sack, v.absent, v.milk]);
     });
   });
 
@@ -395,23 +394,22 @@ function Badge({ status }) {
   );
 }
 
-function Avatar({ name, size }) {
-  const s = size || 56;
-  return (
-    <div
-      style={{ width: s, height: s, backgroundColor: colorForName(name), fontSize: s * 0.36 }}
-      className="rounded-full flex items-center justify-center text-white font-semibold shrink-0 select-none"
-    >
-      {initials(name)}
-    </div>
-  );
-}
-
 function StatCard({ label, value }) {
   return (
     <div className="bg-white rounded-2xl card-shadow p-4 text-center border border-primary-100">
       <p className="text-3xl font-bold text-primary">{value}</p>
       <p className="text-xs font-medium text-primary-500 uppercase mt-1">{label}</p>
+    </div>
+  );
+}
+
+function FloatingSummary({ totals }) {
+  return (
+    <div className="hidden lg:flex flex-col gap-2 fixed left-4 top-28 z-30 bg-white rounded-2xl card-shadow-lg border border-primary-100 p-4 w-36">
+      <p className="font-bold text-primary-900 text-sm leading-tight">Hot: {totals.hot}</p>
+      <p className="font-bold text-primary-900 text-sm leading-tight">Sack: {totals.sack}</p>
+      <p className="font-bold text-primary-900 text-sm leading-tight">Absent: {totals.absent}</p>
+      <p className="font-bold text-primary-900 text-sm leading-tight">Milk: {totals.milk}</p>
     </div>
   );
 }
@@ -657,21 +655,22 @@ function TeacherOverview({ data, onOpenClassroom }) {
 function StudentEntryCard({ student, entry, onChange, disabled }) {
   const e = entry || defaultEntry();
   function set(patch) { if (!disabled) onChange({ ...e, ...patch }); }
+  function setMeal(meal) { set({ meal, milk: meal === 'hot' ? 'yes' : 'no' }); }
 
   return (
-    <div className={"relative rounded-2xl card-shadow p-4 border flex flex-col gap-3 transition-fast " + (e.absent ? 'bg-gray-100 border-gray-300' : 'bg-white border-primary-100')}>
-      <button
-        type="button"
-        disabled={disabled}
-        onClick={() => set({ absent: !e.absent })}
-        className={"absolute top-3 right-3 text-xs font-bold px-2.5 py-1.5 rounded-full transition-fast " + (e.absent ? 'bg-rose-600 text-white' : 'bg-rose-50 text-rose-600 hover:bg-rose-100')}
-      >
-        {e.absent ? 'Undo Absent' : 'Mark Absent'}
-      </button>
-
-      <div className={"flex items-center gap-3 pr-24 " + (e.absent ? 'opacity-60' : '')}>
-        <Avatar name={student.name} size={48} />
-        <p className="font-semibold text-primary-900 truncate">{student.name}</p>
+    <div className={"rounded-2xl card-shadow p-4 border flex flex-col gap-3 transition-fast " + (e.absent ? 'bg-gray-100 border-gray-300' : 'bg-white border-primary-100')}>
+      <div className="flex items-start justify-between gap-2">
+        <p className={"font-semibold text-primary-900 truncate " + (e.absent ? 'opacity-60' : '')}>
+          <span className="text-primary-400 font-medium">#{student.number}</span> {student.firstName} {student.lastName}
+        </p>
+        <button
+          type="button"
+          disabled={disabled}
+          onClick={() => set({ absent: !e.absent })}
+          className={"shrink-0 text-xs font-bold px-2.5 py-1.5 rounded-full transition-fast cursor-pointer " + (e.absent ? 'bg-rose-600 text-white' : 'bg-rose-50 text-rose-600 hover:bg-rose-100')}
+        >
+          {e.absent ? 'Undo Absent' : 'Mark Absent'}
+        </button>
       </div>
 
       <div className={e.absent ? 'opacity-40 pointer-events-none select-none' : ''}>
@@ -680,7 +679,7 @@ function StudentEntryCard({ student, entry, onChange, disabled }) {
           <button
             type="button"
             disabled={disabled}
-            onClick={() => set({ meal: 'hot' })}
+            onClick={() => setMeal('hot')}
             className={"flex-1 btn-touch rounded-xl font-semibold text-sm transition-fast border-2 " + (e.meal === 'hot' ? 'bg-primary text-white border-primary' : 'bg-gray-50 text-gray-400 border-gray-200 hover:bg-gray-100')}
           >
             Hot Lunch
@@ -688,15 +687,15 @@ function StudentEntryCard({ student, entry, onChange, disabled }) {
           <button
             type="button"
             disabled={disabled}
-            onClick={() => set({ meal: 'sack' })}
-            className={"flex-1 btn-touch rounded-xl font-semibold text-sm transition-fast border-2 " + (e.meal === 'sack' ? 'bg-primary text-white border-primary' : 'bg-gray-50 text-gray-400 border-gray-200 hover:bg-gray-100')}
+            onClick={() => setMeal('sack')}
+            className={"flex-1 btn-touch rounded-xl font-semibold text-sm transition-fast border-2 " + (e.meal === 'sack' ? 'bg-gray-200 text-blue-700 border-gray-300' : 'bg-gray-50 text-gray-400 border-gray-200 hover:bg-gray-100')}
           >
             Sack Lunch
           </button>
         </div>
-        <p className="text-xs font-medium text-primary-500 mb-1 uppercase tracking-wide">Milk Picked Up</p>
+        <p className="text-xs font-medium text-primary-500 mb-1 uppercase tracking-wide">Milk Choice</p>
         <div className="flex gap-2">
-          {[['none','None'],['white','White'],['chocolate','Choc.']].map(([val,label]) => (
+          {[['yes','Yes'],['no','No']].map(([val,label]) => (
             <button
               type="button"
               key={val}
@@ -723,7 +722,7 @@ function ReviewStatusControl({ entry, onChange }) {
       onChange={e => {
         const v = e.target.value;
         if (v === 'absent') onChange({ ...entry, absent: true });
-        else onChange({ ...entry, absent: false, meal: v });
+        else onChange({ ...entry, absent: false, meal: v, milk: v === 'hot' ? 'yes' : 'no' });
       }}
       className="text-xs font-semibold border-2 border-primary-200 rounded-lg px-2 py-1 bg-white"
     >
@@ -735,12 +734,11 @@ function ReviewStatusControl({ entry, onChange }) {
 function ReviewStudentCard({ student, entry, onChange }) {
   return (
     <div className="bg-white rounded-xl card-shadow border border-primary-100 p-3 flex items-center gap-3">
-      <Avatar name={student.name} size={36} />
       <div className="flex-1 min-w-0">
-        <p className="font-medium text-primary-900 truncate text-sm">{student.name}</p>
+        <p className="font-medium text-primary-900 truncate text-sm"><span className="text-primary-400">#{student.number}</span> {student.firstName} {student.lastName}</p>
         {!entry.absent && (
           <div className="flex gap-1 mt-1">
-            {[['none','None'],['white','White'],['chocolate','Choc.']].map(([val,label]) => (
+            {[['yes','Milk: Yes'],['no','Milk: No']].map(([val,label]) => (
               <button
                 key={val}
                 type="button"
@@ -777,16 +775,16 @@ function ReviewScreen({ stage, cls, roster, entries, onChangeEntry, onEdit, onSu
 
   return (
     <div>
+      <FloatingSummary totals={totals} />
       <button onClick={onEdit} className="text-primary font-semibold text-sm mb-4 hover:underline">&larr; Edit / Go Back</button>
       <h2 className="text-2xl font-bold text-primary-900 mb-1">{title}</h2>
       <p className="text-primary-600 font-light mb-6">{cls.grade} &middot; {cls.teacher} &middot; {formatDisplayDate(todayStr())}</p>
 
-      <div className="grid grid-cols-2 sm:grid-cols-5 gap-3 mb-6">
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-6">
         <StatCard label="Hot Lunch" value={totals.hot} />
         <StatCard label="Sack Lunch" value={totals.sack} />
         <StatCard label="Absent" value={totals.absent} />
-        <StatCard label="White Milk" value={totals.white} />
-        <StatCard label="Choc. Milk" value={totals.choc} />
+        <StatCard label="Milk" value={totals.milk} />
       </div>
 
       <div className="grid md:grid-cols-3 gap-4 mb-6">
@@ -813,14 +811,71 @@ function ReviewScreen({ stage, cls, roster, entries, onChangeEntry, onEdit, onSu
 
       <div className="sticky bottom-0 bg-secondary/95 backdrop-blur pt-4 pb-2 border-t border-primary-100">
         <div className="flex justify-between items-center flex-wrap gap-3">
-          <p className="text-sm text-primary-600 font-light">
-            Hot {totals.hot} &middot; Sack {totals.sack} &middot; Absent {totals.absent} &middot; White Milk {totals.white} &middot; Choc. Milk {totals.choc}
+          <p className="text-sm text-primary-600 font-light lg:hidden">
+            Hot {totals.hot} &middot; Sack {totals.sack} &middot; Absent {totals.absent} &middot; Milk {totals.milk}
           </p>
-          <div className="flex gap-3">
+          <div className="flex gap-3 ml-auto">
             <GhostButton onClick={onEdit}>Edit / Go Back</GhostButton>
             <PrimaryButton onClick={onSubmit}>{submitLabel}</PrimaryButton>
           </div>
         </div>
+      </div>
+    </div>
+  );
+}
+
+/* ============================ TEACHER: CLASSROOM ENTRY MODAL ============================ */
+function ClassroomEntryModal({ cls, preSubmitted, finalSubmitted, onSelectPre, onSelectFinal, onClose }) {
+  const [lockedError, setLockedError] = useState(false);
+
+  function handleFinalClick() {
+    if (!preSubmitted) { setLockedError(true); return; }
+    onSelectFinal();
+  }
+
+  return (
+    <div className="fixed inset-0 bg-primary-900/50 flex items-center justify-center z-50 p-4">
+      <div className="bg-white rounded-2xl card-shadow-lg p-6 w-full max-w-sm">
+        <div className="flex justify-between items-start gap-3 mb-1">
+          <div>
+            <h2 className="text-xl font-bold text-primary-900">{cls.grade}</h2>
+            <p className="text-sm font-light text-primary-600">{cls.teacher}</p>
+          </div>
+          <button onClick={onClose} className="text-primary-400 hover:text-primary-700 text-2xl leading-none">&times;</button>
+        </div>
+        <p className="text-sm font-light text-primary-600 mb-5 mt-2">Choose which count you'd like to take.</p>
+
+        <div className="flex flex-col gap-3">
+          {preSubmitted ? (
+            <div className="flex flex-col gap-2">
+              <div className="btn-touch w-full px-5 py-3 rounded-xl bg-green-100 text-green-800 border-2 border-green-400 font-semibold text-base flex items-center justify-center gap-2">
+                <span>Morning Pre-Count</span>
+                <span className="text-xs font-bold uppercase">Completed</span>
+              </div>
+              <GhostButton onClick={onSelectPre} className="w-full">View/Edit Morning Count</GhostButton>
+            </div>
+          ) : (
+            <PrimaryButton onClick={onSelectPre} className="w-full">Morning Pre-Count</PrimaryButton>
+          )}
+
+          <div>
+            <button
+              type="button"
+              onClick={handleFinalClick}
+              className={"btn-touch w-full px-5 py-3 rounded-xl font-semibold text-base border-2 transition-fast " + (!preSubmitted ? 'bg-gray-100 text-gray-400 border-gray-200 cursor-not-allowed' : 'bg-primary text-white border-primary hover:bg-primary-700')}
+            >
+              Lunch Time Count{finalSubmitted ? ' ✓' : ''}
+            </button>
+            {lockedError && (
+              <p className="text-xs text-rose-600 font-medium mt-2">Morning pre-count must be submitted first.</p>
+            )}
+            {preSubmitted && !finalSubmitted && !lockedError && (
+              <p className="text-xs text-primary-500 font-light mt-2">Pre-count complete — ready for the Lunch Time Final Count.</p>
+            )}
+          </div>
+        </div>
+
+        <button onClick={onClose} className="text-primary font-semibold text-sm mt-5 hover:underline w-full text-center">Close &amp; Return Home</button>
       </div>
     </div>
   );
@@ -837,6 +892,8 @@ function ClassroomWorkspace({ data, classroomId, onBack }) {
   const [stage, setStage] = useState('pre');
   const [reviewing, setReviewing] = useState(false);
   const [successInfo, setSuccessInfo] = useState(null);
+  const [showEntryModal, setShowEntryModal] = useState(!verified);
+  const [sortBy, setSortBy] = useState('number');
 
   useEffect(() => {
     if (!todayLog) {
@@ -897,9 +954,23 @@ function ClassroomWorkspace({ data, classroomId, onBack }) {
 
   const activeEntries = stage === 'pre' ? preEntries : finalEntries;
   const totals = tallyEntries(activeEntries, roster);
+  const sortedRoster = sortStudents(roster, sortBy);
 
   return (
-    <div className="max-w-6xl mx-auto px-4 sm:px-6 py-8">
+    <div className="max-w-6xl mx-auto px-4 sm:px-6 py-8 lg:pl-40">
+      {!reviewing && roster.length > 0 && <FloatingSummary totals={totals} />}
+
+      {showEntryModal && roster.length > 0 && (
+        <ClassroomEntryModal
+          cls={cls}
+          preSubmitted={preSubmitted}
+          finalSubmitted={finalSubmitted}
+          onSelectPre={() => { setStage('pre'); setReviewing(false); setShowEntryModal(false); }}
+          onSelectFinal={() => { setStage('final'); setReviewing(false); setShowEntryModal(false); }}
+          onClose={onBack}
+        />
+      )}
+
       <div className="flex items-center justify-between mb-6 flex-wrap gap-3">
         <div>
           <button onClick={onBack} className="text-primary font-semibold text-sm mb-2 hover:underline">&larr; Back to Overview</button>
@@ -923,7 +994,7 @@ function ClassroomWorkspace({ data, classroomId, onBack }) {
         <ReviewScreen
           stage={stage}
           cls={cls}
-          roster={roster}
+          roster={sortedRoster}
           entries={activeEntries}
           onChangeEntry={(studentId, entry) => updateEntry(stage, studentId, entry)}
           onEdit={() => setReviewing(false)}
@@ -969,8 +1040,17 @@ function ClassroomWorkspace({ data, classroomId, onBack }) {
             </div>
           )}
 
+          <div className="flex items-center justify-end gap-2 mb-4">
+            <label className="text-xs font-medium text-primary-500 uppercase">Sort by</label>
+            <select value={sortBy} onChange={e => setSortBy(e.target.value)} className="border-2 border-primary-200 rounded-lg px-2 py-1.5 text-sm">
+              <option value="number">Student #</option>
+              <option value="first">First Name</option>
+              <option value="last">Last Name</option>
+            </select>
+          </div>
+
           <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4 mb-8">
-            {roster.map(s => (
+            {sortedRoster.map(s => (
               <StudentEntryCard
                 key={s.id}
                 student={s}
@@ -983,10 +1063,10 @@ function ClassroomWorkspace({ data, classroomId, onBack }) {
 
           <div className="sticky bottom-0 bg-secondary/95 backdrop-blur pt-4 pb-2 border-t border-primary-100">
             <div className="flex justify-between items-center flex-wrap gap-3">
-              <p className="text-sm text-primary-600 font-light">
-                Hot {totals.hot} &middot; Sack {totals.sack} &middot; Absent {totals.absent} &middot; White Milk {totals.white} &middot; Choc. Milk {totals.choc}
+              <p className="text-sm text-primary-600 font-light lg:hidden">
+                Hot {totals.hot} &middot; Sack {totals.sack} &middot; Absent {totals.absent} &middot; Milk {totals.milk}
               </p>
-              <div className="flex gap-3">
+              <div className="flex gap-3 ml-auto">
                 <GhostButton onClick={onBack}>Cancel</GhostButton>
                 <PrimaryButton disabled={verified} onClick={() => setReviewing(true)}>
                   {stage === 'pre' ? 'Review Morning Count' : 'Review Lunch Time Count'} &rarr;
@@ -1050,8 +1130,8 @@ function VerificationPanel({ data }) {
         <p className="text-sm font-light text-primary-500">No classrooms yet.</p>
       ) : (
         <div className="grid gap-4">
-          {data.classrooms.map(cls => {
-            const roster = data.students.filter(s => s.classroomId === cls.id);
+          {data.classrooms.slice().sort((a,b) => a.grade.localeCompare(b.grade, undefined, { numeric: true })).map(cls => {
+            const roster = sortStudents(data.students.filter(s => s.classroomId === cls.id), 'number');
             const log = data.logsById[logId(dateVal, cls.id)];
             const preEntries = (log && log.pre && log.pre.entries) || {};
             const finalEntries = (log && log.final && log.final.entries) || {};
@@ -1065,7 +1145,7 @@ function VerificationPanel({ data }) {
             const changedStudents = finalSubmitted ? roster.filter(s => entryChanged(preEntries[s.id], finalEntries[s.id])) : [];
             const summaryDiffs = [];
             if (finalSubmitted) {
-              [['Hot Lunch','hot'],['Sack Lunch','sack'],['Absent','absent'],['White Milk','white'],['Chocolate Milk','choc']].forEach(([label,key]) => {
+              [['Hot Lunch','hot'],['Sack Lunch','sack'],['Absent','absent'],['Milk','milk']].forEach(([label,key]) => {
                 if (preT[key] !== finalT[key]) {
                   const delta = finalT[key] - preT[key];
                   summaryDiffs.push(label + ': ' + preT[key] + ' \u2192 ' + finalT[key] + ' (' + (delta > 0 ? '+' : '') + delta + ')');
@@ -1082,16 +1162,28 @@ function VerificationPanel({ data }) {
                   </div>
                   <Badge status={status} />
                 </div>
-                <div className="grid sm:grid-cols-2 gap-4 mb-4">
-                  <div className="bg-primary-50 rounded-xl p-3">
-                    <p className="text-xs font-semibold text-primary-700 uppercase mb-1">Morning Pre-Count {preSubmitted ? '' : '(not submitted)'}</p>
-                    <p className="text-sm text-primary-800">Hot {preT.hot} &middot; Sack {preT.sack} &middot; Absent {preT.absent} &middot; White {preT.white} &middot; Choc. {preT.choc}</p>
+
+                {verified ? (
+                  <div className="bg-purple-50 border border-purple-200 rounded-xl p-4 mb-4">
+                    <p className="text-xs font-semibold text-purple-700 uppercase mb-2">Verified Final Count</p>
+                    <p className="font-bold text-primary-900 text-sm leading-snug">Hot: {finalT.hot}</p>
+                    <p className="font-bold text-primary-900 text-sm leading-snug">Sack: {finalT.sack}</p>
+                    <p className="font-bold text-primary-900 text-sm leading-snug">Absent: {finalT.absent}</p>
+                    <p className="font-bold text-primary-900 text-sm leading-snug">Milk: {finalT.milk}</p>
+                    <p className="font-bold text-purple-700 text-sm leading-snug mt-1">Verified</p>
                   </div>
-                  <div className="bg-primary-50 rounded-xl p-3">
-                    <p className="text-xs font-semibold text-primary-700 uppercase mb-1">Lunchtime Final Count {finalSubmitted ? '' : '(not submitted)'}</p>
-                    <p className="text-sm text-primary-800">Hot {finalT.hot} &middot; Sack {finalT.sack} &middot; Absent {finalT.absent} &middot; White {finalT.white} &middot; Choc. {finalT.choc}</p>
+                ) : (
+                  <div className="grid sm:grid-cols-2 gap-4 mb-4">
+                    <div className="bg-primary-50 rounded-xl p-3">
+                      <p className="text-xs font-semibold text-primary-700 uppercase mb-1">Morning Pre-Count {preSubmitted ? '' : '(not submitted)'}</p>
+                      <p className="text-sm text-primary-800">Hot {preT.hot} &middot; Sack {preT.sack} &middot; Absent {preT.absent} &middot; Milk {preT.milk}</p>
+                    </div>
+                    <div className="bg-primary-50 rounded-xl p-3">
+                      <p className="text-xs font-semibold text-primary-700 uppercase mb-1">Lunchtime Final Count {finalSubmitted ? '' : '(not submitted)'}</p>
+                      <p className="text-sm text-primary-800">Hot {finalT.hot} &middot; Sack {finalT.sack} &middot; Absent {finalT.absent} &middot; Milk {finalT.milk}</p>
+                    </div>
                   </div>
-                </div>
+                )}
 
                 {finalSubmitted && summaryDiffs.length > 0 && (
                   <div className="mb-4 bg-amber-50 border border-amber-300 rounded-xl p-3">
@@ -1100,34 +1192,38 @@ function VerificationPanel({ data }) {
                   </div>
                 )}
 
-                <button onClick={() => toggleExpand(cls.id)} className="text-xs font-semibold text-primary hover:underline mb-3">
-                  {expanded[cls.id] ? 'Hide Student Detail \u25b2' : 'Show Student Detail \u25bc'}
-                </button>
+                {finalSubmitted && (
+                  <button onClick={() => toggleExpand(cls.id)} className="text-xs font-semibold text-primary hover:underline mb-3">
+                    {expanded[cls.id] ? 'Hide Student Detail \u25b2' : 'Show Student Detail \u25bc'}
+                  </button>
+                )}
 
-                {expanded[cls.id] && (
+                {finalSubmitted && expanded[cls.id] && (
                   <div className="border border-primary-100 rounded-xl overflow-hidden mb-4 overflow-x-auto">
+                    <p className="text-xs font-semibold text-primary-500 uppercase px-2 pt-2 bg-primary-50">Verified Final Count</p>
                     <table className="w-full text-sm">
                       <thead>
                         <tr className="bg-primary-50 text-primary-700 text-left">
                           <th className="p-2 font-semibold">Student</th>
-                          <th className="p-2 font-semibold">Morning</th>
-                          <th className="p-2 font-semibold">Final</th>
-                          <th className="p-2 font-semibold">Milk (Final)</th>
+                          <th className="p-2 font-semibold">Final Count</th>
+                          <th className="p-2 font-semibold">Milk</th>
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-primary-50">
                         {roster.map(s => {
                           const pe = preEntries[s.id] || defaultEntry();
                           const fe = finalEntries[s.id] || defaultEntry();
-                          const changed = finalSubmitted && entryChanged(pe, fe);
+                          const changed = entryChanged(pe, fe);
+                          const mealColor = fe.absent ? 'text-primary-700' : (fe.meal === 'hot' ? 'text-gray-400' : 'text-blue-600');
+                          const milkOn = !fe.absent && fe.milk === 'yes';
+                          const milkColor = !milkOn ? 'text-primary-300' : (fe.meal === 'sack' ? 'text-blue-600' : 'text-gray-400');
                           return (
-                            <tr key={s.id} className={changed ? 'bg-amber-50' : ''}>
+                            <tr key={s.id}>
                               <td className="p-2 font-medium text-primary-900">
-                                {s.name}{changed && <span className="ml-1 text-[10px] font-bold text-amber-700 bg-amber-200 px-1.5 py-0.5 rounded-full">Changed</span>}
+                                #{s.number} {s.firstName} {s.lastName}{changed && <span className="ml-1 text-[10px] font-bold text-amber-700 bg-amber-100 px-1.5 py-0.5 rounded-full">Changed</span>}
                               </td>
-                              <td className="p-2 text-primary-700">{preSubmitted ? entryStatusLabel(pe) : '—'}</td>
-                              <td className="p-2 text-primary-700">{finalSubmitted ? entryStatusLabel(fe) : '—'}</td>
-                              <td className="p-2 text-primary-700">{finalSubmitted ? entryMilkLabel(fe) : '—'}</td>
+                              <td className={"p-2 font-semibold " + mealColor}>{entryStatusLabel(fe)}</td>
+                              <td className={"p-2 font-semibold " + milkColor}>{entryMilkLabel(fe)}</td>
                             </tr>
                           );
                         })}
@@ -1191,10 +1287,12 @@ function AnalyticsDashboard({ data }) {
   const studentAgg = useMemo(() => aggregateRangeByStudent(data, startDate, endDate), [data, startDate.getTime(), endDate.getTime()]);
 
   const overall = useMemo(() => {
-    let hot = 0, sack = 0, absent = 0, white = 0, choc = 0;
-    Object.values(agg).forEach(v => { hot += v.hot; sack += v.sack; absent += v.absent; white += v.white; choc += v.choc; });
-    return { hot, sack, absent, white, choc };
+    let hot = 0, sack = 0, absent = 0, milk = 0;
+    Object.values(agg).forEach(v => { hot += v.hot; sack += v.sack; absent += v.absent; milk += v.milk; });
+    return { hot, sack, absent, milk };
   }, [agg]);
+
+  const sortedClassrooms = useMemo(() => data.classrooms.slice().sort((a,b) => a.grade.localeCompare(b.grade, undefined, { numeric: true })), [data.classrooms]);
 
   return (
     <div>
@@ -1237,21 +1335,20 @@ function AnalyticsDashboard({ data }) {
         <div className="bg-amber-50 border border-amber-300 text-amber-800 rounded-xl p-4 text-sm font-medium mb-6">{rangeError}</div>
       ) : (
         <React.Fragment>
-          <div className="grid grid-cols-2 sm:grid-cols-5 gap-3 mb-8">
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-8">
             <StatCard label="Hot Lunches" value={overall.hot} />
             <StatCard label="Sack Lunches" value={overall.sack} />
             <StatCard label="Absences" value={overall.absent} />
-            <StatCard label="White Milk" value={overall.white} />
-            <StatCard label="Choc. Milk" value={overall.choc} />
+            <StatCard label="Milk" value={overall.milk} />
           </div>
 
-          {data.classrooms.length === 0 ? (
+          {sortedClassrooms.length === 0 ? (
             <p className="text-sm font-light text-primary-500">No classrooms yet.</p>
           ) : (
             <div className="grid gap-4">
-              {data.classrooms.map(c => {
-                const v = agg[c.id] || { hot: 0, sack: 0, absent: 0, white: 0, choc: 0 };
-                const roster = data.students.filter(s => s.classroomId === c.id);
+              {sortedClassrooms.map(c => {
+                const v = agg[c.id] || { hot: 0, sack: 0, absent: 0, milk: 0 };
+                const roster = sortStudents(data.students.filter(s => s.classroomId === c.id), 'number');
                 return (
                   <div key={c.id} className="bg-white rounded-2xl card-shadow border border-primary-100 p-5">
                     <div className="flex justify-between items-start mb-3 flex-wrap gap-2">
@@ -1259,19 +1356,18 @@ function AnalyticsDashboard({ data }) {
                         <h4 className="font-bold text-primary-900">{classroomLabel(c)}</h4>
                         <p className="text-xs font-light text-primary-500">{roster.length} students</p>
                       </div>
-                      <p className="text-sm text-primary-700 font-medium">Hot {v.hot} &middot; Sack {v.sack} &middot; Absent {v.absent} &middot; White {v.white} &middot; Choc. {v.choc}</p>
+                      <p className="text-sm text-primary-700 font-medium">Hot {v.hot} &middot; Sack {v.sack} &middot; Absent {v.absent} &middot; Milk {v.milk}</p>
                     </div>
                     {roster.length > 0 && (
                       <div className="border-t border-primary-50 pt-3 mt-2">
                         <p className="text-xs font-semibold text-primary-500 uppercase mb-2">Student Detail</p>
                         <div className="divide-y divide-primary-50">
                           {roster.map(s => {
-                            const sv = studentAgg[s.id] || { hot: 0, sack: 0, absent: 0, white: 0, choc: 0 };
+                            const sv = studentAgg[s.id] || { hot: 0, sack: 0, absent: 0, milk: 0 };
                             return (
                               <div key={s.id} className="flex items-center gap-3 py-2">
-                                <Avatar name={s.name} size={32} />
-                                <p className="font-medium text-primary-900 flex-1 min-w-0 truncate text-sm">{s.name}</p>
-                                <p className="text-xs text-primary-600 font-light">Hot {sv.hot} &middot; Sack {sv.sack} &middot; Absent {sv.absent} &middot; White {sv.white} &middot; Choc. {sv.choc}</p>
+                                <p className="font-medium text-primary-900 flex-1 min-w-0 truncate text-sm">#{s.number} {s.firstName} {s.lastName}</p>
+                                <p className="text-xs text-primary-600 font-light">Hot {sv.hot} &middot; Sack {sv.sack} &middot; Absent {sv.absent} &middot; Milk {sv.milk}</p>
                               </div>
                             );
                           })}
@@ -1292,9 +1388,9 @@ function AnalyticsDashboard({ data }) {
 /* ============================ ADMIN: TERM & CALENDAR SETTINGS ============================ */
 function TermSettingsPanel({ settings }) {
   const terms = settings.terms || {};
-  const [activeTerm, setActiveTerm] = useState('Q1');
-  const [start, setStart] = useState((terms.Q1 && terms.Q1.start) || '');
-  const [end, setEnd] = useState((terms.Q1 && terms.Q1.end) || '');
+  const [activeTerm, setActiveTerm] = useState('S1');
+  const [start, setStart] = useState((terms.S1 && terms.S1.start) || '');
+  const [end, setEnd] = useState((terms.S1 && terms.S1.end) || '');
   const [savedMsg, setSavedMsg] = useState('');
 
   useEffect(() => {
@@ -1356,14 +1452,19 @@ function TermSettingsPanel({ settings }) {
 
 /* ============================ ADMIN: STUDENT MANAGEMENT ============================ */
 function StudentManagement({ data }) {
-  const [newName, setNewName] = useState('');
+  const [newNumber, setNewNumber] = useState('');
+  const [newFirst, setNewFirst] = useState('');
+  const [newLast, setNewLast] = useState('');
   const [newClass, setNewClass] = useState(data.classrooms[0] ? data.classrooms[0].id : '');
   const [editingId, setEditingId] = useState(null);
-  const [editName, setEditName] = useState('');
+  const [editNumber, setEditNumber] = useState('');
+  const [editFirst, setEditFirst] = useState('');
+  const [editLast, setEditLast] = useState('');
 
   const [search, setSearch] = useState('');
   const [filterClassroom, setFilterClassroom] = useState('');
-  const [sortBy, setSortBy] = useState('name');
+  const [sortBy, setSortBy] = useState('classroom');
+  const [studentSortBy, setStudentSortBy] = useState('number');
 
   const [importRows, setImportRows] = useState(null);
   const [importBusy, setImportBusy] = useState(false);
@@ -1376,9 +1477,9 @@ function StudentManagement({ data }) {
 
   async function addStudent(e) {
     e.preventDefault();
-    if (!newName.trim() || !newClass) return;
-    await saveStudent({ name: newName.trim(), classroomId: newClass });
-    setNewName('');
+    if (!newNumber.trim() || !newFirst.trim() || !newLast.trim() || !newClass) return;
+    await saveStudent({ number: newNumber.trim(), firstName: newFirst.trim(), lastName: newLast.trim(), classroomId: newClass });
+    setNewNumber(''); setNewFirst(''); setNewLast('');
   }
 
   async function deleteStudent(id) {
@@ -1389,14 +1490,20 @@ function StudentManagement({ data }) {
   async function moveStudent(id, classroomId) {
     const s = data.students.find(x => x.id === id);
     if (!s) return;
-    await saveStudent({ id, name: s.name, classroomId });
+    await saveStudent({ id, number: s.number, firstName: s.firstName, lastName: s.lastName, classroomId });
   }
 
-  function startEdit(s) { setEditingId(s.id); setEditName(s.name); }
+  function startEdit(s) { setEditingId(s.id); setEditNumber(String(s.number)); setEditFirst(s.firstName); setEditLast(s.lastName); }
   async function saveEdit(id) {
     const s = data.students.find(x => x.id === id);
     if (!s) return;
-    await saveStudent({ id, name: editName.trim() || s.name, classroomId: s.classroomId });
+    await saveStudent({
+      id,
+      number: editNumber.trim() || s.number,
+      firstName: editFirst.trim() || s.firstName,
+      lastName: editLast.trim() || s.lastName,
+      classroomId: s.classroomId
+    });
     setEditingId(null);
   }
 
@@ -1404,7 +1511,7 @@ function StudentManagement({ data }) {
     let list = data.classrooms.slice();
     if (filterClassroom) list = list.filter(c => c.id === filterClassroom);
     if (sortBy === 'classroom') list.sort((a,b) => classroomLabel(a).localeCompare(classroomLabel(b)));
-    if (sortBy === 'grade') list.sort((a,b) => a.grade.localeCompare(b.grade));
+    if (sortBy === 'grade') list.sort((a,b) => a.grade.localeCompare(b.grade, undefined, { numeric: true }));
     return list;
   }, [data.classrooms, filterClassroom, sortBy]);
 
@@ -1412,9 +1519,9 @@ function StudentManagement({ data }) {
     let list = data.students.filter(s => s.classroomId === classroomId);
     if (search.trim()) {
       const q = search.trim().toLowerCase();
-      list = list.filter(s => s.name.toLowerCase().includes(q));
+      list = list.filter(s => (s.firstName + ' ' + s.lastName).toLowerCase().includes(q) || String(s.number).includes(q));
     }
-    return list.slice().sort((a,b) => a.name.localeCompare(b.name));
+    return sortStudents(list, studentSortBy);
   }
 
   function handleFileSelected(e) {
@@ -1428,24 +1535,26 @@ function StudentManagement({ data }) {
         const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '' });
         if (!rows.length) { alert('That file appears to be empty.'); return; }
         const header = rows[0].map(h => String(h).trim().toLowerCase());
-        const nameIdx = header.indexOf('name');
-        const gradeIdx = header.indexOf('grade');
-        const teacherIdx = header.indexOf('teacher');
-        if (nameIdx === -1 || gradeIdx === -1 || teacherIdx === -1) {
-          alert('The file must have a header row with columns: Name, Grade, Teacher');
+        const numberIdx = header.indexOf('student #');
+        const firstIdx = header.indexOf('first name');
+        const lastIdx = header.indexOf('last name');
+        const classroomIdx = header.indexOf('classroom');
+        if (numberIdx === -1 || firstIdx === -1 || lastIdx === -1 || classroomIdx === -1) {
+          alert('The file must have a header row with columns: Student #, First Name, Last Name, Classroom');
           return;
         }
-        const parsed = rows.slice(1).filter(r => r.length && String(r[nameIdx]).trim()).map(r => {
-          const name = String(r[nameIdx]).trim();
-          const grade = String(r[gradeIdx]).trim();
-          const teacher = String(r[teacherIdx]).trim();
-          const match = data.classrooms.find(c => c.grade.trim().toLowerCase() === grade.toLowerCase() && c.teacher.trim().toLowerCase() === teacher.toLowerCase());
-          return { name, grade, teacher, classroomId: match ? match.id : null };
+        const parsed = rows.slice(1).filter(r => r.length && (String(r[firstIdx]).trim() || String(r[lastIdx]).trim())).map(r => {
+          const number = String(r[numberIdx]).trim();
+          const firstName = String(r[firstIdx]).trim();
+          const lastName = String(r[lastIdx]).trim();
+          const classroomVal = String(r[classroomIdx]).trim().toLowerCase();
+          const match = data.classrooms.find(c => classroomLabel(c).trim().toLowerCase() === classroomVal);
+          return { number, firstName, lastName, classroomText: String(r[classroomIdx]).trim(), classroomId: match ? match.id : null };
         });
         setImportRows(parsed);
       } catch (err) {
         console.error(err);
-        alert('Could not read that file. Please upload a CSV or Excel (.xlsx) file with columns: Name, Grade, Teacher.');
+        alert('Could not read that file. Please upload a CSV or Excel (.xlsx) file with columns: Student #, First Name, Last Name, Classroom.');
       }
     };
     reader.readAsArrayBuffer(file);
@@ -1456,7 +1565,7 @@ function StudentManagement({ data }) {
     setImportBusy(true);
     const matched = importRows.filter(r => r.classroomId);
     for (const r of matched) {
-      await saveStudent({ name: r.name, classroomId: r.classroomId });
+      await saveStudent({ number: r.number, firstName: r.firstName, lastName: r.lastName, classroomId: r.classroomId });
     }
     setImportBusy(false);
     setImportRows(null);
@@ -1472,9 +1581,17 @@ function StudentManagement({ data }) {
         <p className="text-sm font-light text-primary-500 mb-4">Add a classroom first before adding students.</p>
       ) : (
         <form onSubmit={addStudent} className="bg-white rounded-2xl card-shadow p-4 border border-primary-100 mb-4 flex flex-wrap gap-3 items-end">
-          <div className="flex-1 min-w-[180px]">
-            <label className="text-xs font-medium text-primary-500 uppercase">New Student Name</label>
-            <input value={newName} onChange={e => setNewName(e.target.value)} placeholder="e.g. Grace Miller" className="w-full border-2 border-primary-200 rounded-xl px-3 py-2 mt-1 focus:outline-none focus:border-primary" />
+          <div className="w-24">
+            <label className="text-xs font-medium text-primary-500 uppercase">Student #</label>
+            <input value={newNumber} onChange={e => setNewNumber(e.target.value)} placeholder="101" className="w-full border-2 border-primary-200 rounded-xl px-3 py-2 mt-1 focus:outline-none focus:border-primary" />
+          </div>
+          <div className="flex-1 min-w-[140px]">
+            <label className="text-xs font-medium text-primary-500 uppercase">First Name</label>
+            <input value={newFirst} onChange={e => setNewFirst(e.target.value)} placeholder="Grace" className="w-full border-2 border-primary-200 rounded-xl px-3 py-2 mt-1 focus:outline-none focus:border-primary" />
+          </div>
+          <div className="flex-1 min-w-[140px]">
+            <label className="text-xs font-medium text-primary-500 uppercase">Last Name</label>
+            <input value={newLast} onChange={e => setNewLast(e.target.value)} placeholder="Miller" className="w-full border-2 border-primary-200 rounded-xl px-3 py-2 mt-1 focus:outline-none focus:border-primary" />
           </div>
           <div>
             <label className="text-xs font-medium text-primary-500 uppercase">Classroom</label>
@@ -1488,25 +1605,27 @@ function StudentManagement({ data }) {
 
       <div className="bg-white rounded-2xl card-shadow p-4 border border-primary-100 mb-6">
         <p className="text-sm font-semibold text-primary-800 mb-2">Batch Upload Roster (CSV or Excel)</p>
-        <p className="text-xs font-light text-primary-500 mb-3">File must include a header row with columns named exactly: <span className="font-semibold">Name</span>, <span className="font-semibold">Grade</span>, <span className="font-semibold">Teacher</span>. Grade and Teacher must match an existing classroom.</p>
+        <p className="text-xs font-light text-primary-500 mb-3">File must include a header row with columns named exactly: <span className="font-semibold">Student #</span>, <span className="font-semibold">First Name</span>, <span className="font-semibold">Last Name</span>, <span className="font-semibold">Classroom</span>. Classroom must match an existing classroom's "Grade — Teacher" label exactly.</p>
         <input ref={fileInputRef} type="file" accept=".csv,.xlsx,.xls" onChange={handleFileSelected} className="text-sm" />
         {importRows && (
           <div className="mt-4 border border-primary-100 rounded-xl overflow-hidden overflow-x-auto">
             <table className="w-full text-sm">
               <thead>
                 <tr className="bg-primary-50 text-primary-700 text-left">
-                  <th className="p-2 font-semibold">Name</th>
-                  <th className="p-2 font-semibold">Grade</th>
-                  <th className="p-2 font-semibold">Teacher</th>
+                  <th className="p-2 font-semibold">Student #</th>
+                  <th className="p-2 font-semibold">First Name</th>
+                  <th className="p-2 font-semibold">Last Name</th>
+                  <th className="p-2 font-semibold">Classroom</th>
                   <th className="p-2 font-semibold">Match</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-primary-50">
                 {importRows.map((r,i) => (
                   <tr key={i} className={!r.classroomId ? 'bg-rose-50' : ''}>
-                    <td className="p-2">{r.name}</td>
-                    <td className="p-2">{r.grade}</td>
-                    <td className="p-2">{r.teacher}</td>
+                    <td className="p-2">{r.number}</td>
+                    <td className="p-2">{r.firstName}</td>
+                    <td className="p-2">{r.lastName}</td>
+                    <td className="p-2">{r.classroomText}</td>
                     <td className="p-2">{r.classroomId ? <span className="text-green-700 font-semibold">Matched</span> : <span className="text-rose-600 font-semibold">No matching classroom</span>}</td>
                   </tr>
                 ))}
@@ -1523,7 +1642,7 @@ function StudentManagement({ data }) {
       <div className="flex flex-wrap gap-3 mb-4 items-end">
         <div className="flex-1 min-w-[180px]">
           <label className="text-xs font-medium text-primary-500 uppercase block mb-1">Search Students</label>
-          <input value={search} onChange={e => setSearch(e.target.value)} placeholder="Search by name…" className="w-full border-2 border-primary-200 rounded-xl px-3 py-2 focus:outline-none focus:border-primary" />
+          <input value={search} onChange={e => setSearch(e.target.value)} placeholder="Search by name or #…" className="w-full border-2 border-primary-200 rounded-xl px-3 py-2 focus:outline-none focus:border-primary" />
         </div>
         <div>
           <label className="text-xs font-medium text-primary-500 uppercase block mb-1">Filter by Classroom</label>
@@ -1535,9 +1654,16 @@ function StudentManagement({ data }) {
         <div>
           <label className="text-xs font-medium text-primary-500 uppercase block mb-1">Sort Groups By</label>
           <select value={sortBy} onChange={e => setSortBy(e.target.value)} className="border-2 border-primary-200 rounded-xl px-3 py-2">
-            <option value="name">Original Order</option>
             <option value="classroom">Classroom Name (A–Z)</option>
             <option value="grade">Grade (A–Z)</option>
+          </select>
+        </div>
+        <div>
+          <label className="text-xs font-medium text-primary-500 uppercase block mb-1">Sort Students By</label>
+          <select value={studentSortBy} onChange={e => setStudentSortBy(e.target.value)} className="border-2 border-primary-200 rounded-xl px-3 py-2">
+            <option value="number">Student #</option>
+            <option value="first">First Name</option>
+            <option value="last">Last Name</option>
           </select>
         </div>
       </div>
@@ -1556,11 +1682,14 @@ function StudentManagement({ data }) {
                 {students.length === 0 && <p className="p-4 text-sm font-light text-primary-500">No students.</p>}
                 {students.map(s => (
                   <div key={s.id} className="flex items-center gap-3 p-4 flex-wrap">
-                    <Avatar name={s.name} size={40} />
                     {editingId === s.id ? (
-                      <input value={editName} onChange={e => setEditName(e.target.value)} className="border-2 border-primary-200 rounded-lg px-2 py-1 flex-1 min-w-[140px]" autoFocus />
+                      <React.Fragment>
+                        <input value={editNumber} onChange={e => setEditNumber(e.target.value)} className="border-2 border-primary-200 rounded-lg px-2 py-1 w-20" placeholder="#" autoFocus />
+                        <input value={editFirst} onChange={e => setEditFirst(e.target.value)} className="border-2 border-primary-200 rounded-lg px-2 py-1 flex-1 min-w-[110px]" placeholder="First" />
+                        <input value={editLast} onChange={e => setEditLast(e.target.value)} className="border-2 border-primary-200 rounded-lg px-2 py-1 flex-1 min-w-[110px]" placeholder="Last" />
+                      </React.Fragment>
                     ) : (
-                      <p className="font-medium text-primary-900 flex-1 min-w-[140px]">{s.name}</p>
+                      <p className="font-medium text-primary-900 flex-1 min-w-[140px]"><span className="text-primary-400">#{s.number}</span> {s.firstName} {s.lastName}</p>
                     )}
                     <select
                       value={s.classroomId}
